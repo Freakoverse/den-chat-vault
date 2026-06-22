@@ -112,7 +112,7 @@ async function kvSet(k: string, v: unknown): Promise<void> {
 // A "seed" is a PIN-encrypted secret: a BIP-39 mnemonic (kind 'seed') or a single
 // nsec/hex key (kind 'key'). Accounts are plaintext metadata derived from a seed at
 // an index — a 'key' seed has exactly one account at index 0 and cannot derive more.
-interface SeedMeta { id: string; name: string | null; kind: 'seed' | 'key'; createdAt: number }
+interface SeedMeta { id: string; name: string | null; kind: 'seed' | 'key'; hint: string | null; createdAt: number }
 interface AccountMeta { pubkey: string; npub: string; seedId: string; index: number; name: string | null; createdAt: number }
 const seedBlobKey = (id: string) => `seedblob:${id}`
 const now = () => Math.floor(Date.now() / 1000)
@@ -189,12 +189,12 @@ const ops: Record<string, (p?: any) => Promise<unknown>> = {
     return { mnemonic, pubkey: deriveKeypair(mnemonic).pubHex }
   },
   // Persist a generated mnemonic as a new seed + its first account (index 0), encrypted with `pin`.
-  async saveNew({ mnemonic, pin, name }: { mnemonic: string; pin: string; name?: string }) {
+  async saveNew({ mnemonic, pin, name, hint }: { mnemonic: string; pin: string; name?: string; hint?: string }) {
     if (!validateMnemonic(mnemonic, wordlist)) throw new Error('Invalid mnemonic')
     const { privHex, pubHex } = deriveKeypair(mnemonic, 0)
     const seedId = pubHex
     await kvSet(seedBlobKey(seedId), await encryptBackup(mnemonic, pin))
-    await upsertSeed({ id: seedId, name: name || null, kind: 'seed', createdAt: now() })
+    await upsertSeed({ id: seedId, name: name || null, kind: 'seed', hint: hint || null, createdAt: now() })
     await upsertAccount({ pubkey: pubHex, npub: nip19.npubEncode(pubHex), seedId, index: 0, name: name || null, createdAt: now() })
     await rateReset(seedId)
     unlockSession(privHex)
@@ -202,7 +202,7 @@ const ops: Record<string, (p?: any) => Promise<unknown>> = {
   },
   // Import an encrypted backup (mnemonic OR nsec/hex key) as a new seed; its password
   // becomes the seed PIN. The imported payload IS the at-rest blob (no re-encryption).
-  async importBackup({ payload, password, name }: { payload: BackupPayloadV1; password: string; name?: string }) {
+  async importBackup({ payload, password, name, hint }: { payload: BackupPayloadV1; password: string; name?: string; hint?: string }) {
     let secret: string
     // WebCrypto throws a message-less DOMException on a bad password; surface a clear error.
     try { secret = await decryptBackup(payload, password) }
@@ -211,7 +211,7 @@ const ops: Record<string, (p?: any) => Promise<unknown>> = {
     const { privHex, pubHex } = keypairFromSecret(secret, 0)
     const seedId = pubHex
     await kvSet(seedBlobKey(seedId), payload)
-    await upsertSeed({ id: seedId, name: name || null, kind: isSeed ? 'seed' : 'key', createdAt: now() })
+    await upsertSeed({ id: seedId, name: name || null, kind: isSeed ? 'seed' : 'key', hint: hint || null, createdAt: now() })
     await upsertAccount({ pubkey: pubHex, npub: nip19.npubEncode(pubHex), seedId, index: 0, name: name || null, createdAt: now() })
     await rateReset(seedId)
     unlockSession(privHex)
@@ -229,9 +229,10 @@ const ops: Record<string, (p?: any) => Promise<unknown>> = {
     await rateReset(seedId)
     const used = (await getAccounts()).filter((a) => a.seedId === seedId).map((a) => a.index)
     const index = (used.length ? Math.max(...used) : -1) + 1
-    const { privHex, pubHex } = deriveKeypair(mnemonic, index)
+    const { pubHex } = deriveKeypair(mnemonic, index)
+    // Just record the account — the app returns to account selection; the user picks
+    // it and unlocks (re-enters the PIN) to actually sign in.
     await upsertAccount({ pubkey: pubHex, npub: nip19.npubEncode(pubHex), seedId, index, name: name || null, createdAt: now() })
-    unlockSession(privHex)
     return { pubkey: pubHex }
   },
   async unlock({ pubkey, pin }: { pubkey: string; pin: string }) {
