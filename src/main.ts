@@ -126,7 +126,7 @@ async function rateReset(): Promise<void> { await kvSet('rate', { fails: 0, lock
 /* ─── Operations ─── */
 async function getBlob() { return kvGet<BackupPayloadV1>('blob') }
 
-const ops: Record<string, (p: any) => Promise<unknown>> = {
+const ops: Record<string, (p?: any) => Promise<unknown>> = {
   async status() {
     return { hasIdentity: !!(await getBlob()), unlocked: !!sessionPriv, pubkey: sessionPub }
   },
