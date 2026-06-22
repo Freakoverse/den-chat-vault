@@ -23,7 +23,7 @@ import { getPublicKey, finalizeEvent, nip04, nip44, nip19, type EventTemplate } 
 
 /* ─── Config (EDIT BEFORE DEPLOY) ─── */
 const ALLOWED_PARENT_ORIGINS = ['https://web.denchat.top']
-const SESSION_IDLE_MS = 10 * 60_000        // auto-lock after 10 min idle
+const SESSION_IDLE_MS = 30 * 60_000        // auto-lock after 30 min idle
 const RATE_FREE_ATTEMPTS = 3               // failures before backoff starts
 const RATE_STEP_MS = [5_000, 30_000, 120_000, 600_000] // escalating lockout windows
 
