@@ -62,6 +62,25 @@ function deriveKeypair(mnemonic: string, index = 0): { privHex: string; pubHex: 
   return { privHex, pubHex: getPublicKey(hexToBytes(privHex)) }
 }
 
+/**
+ * Turn a stored secret into a keypair. Accepts a BIP-39 mnemonic (seed account,
+ * HD-derived), an `nsec1…` private key, or a raw 64-char hex private key —
+ * so backups exported from nsec-based accounts import correctly too.
+ */
+function secretToKeypair(secret: string): { privHex: string; pubHex: string } {
+  const s = secret.trim()
+  if (validateMnemonic(s, wordlist)) return deriveKeypair(s)
+  let privHex: string | null = null
+  if (s.startsWith('nsec1')) {
+    const dec = nip19.decode(s)
+    if (dec.type === 'nsec') privHex = bytesToHex(dec.data as Uint8Array)
+  } else if (/^[0-9a-fA-F]{64}$/.test(s)) {
+    privHex = s.toLowerCase()
+  }
+  if (!privHex) throw new Error('Backup did not contain a valid key or recovery phrase')
+  return { privHex, pubHex: getPublicKey(hexToBytes(privHex)) }
+}
+
 /* ─── IndexedDB (blob + rate-limit state) ─── */
 const DB = 'den-vault', STORE = 'kv'
 function idb(): Promise<IDBDatabase> {
@@ -164,9 +183,11 @@ const ops: Record<string, (p?: any) => Promise<unknown>> = {
   // Import an encrypted backup file (same format). Its password becomes the account
   // PIN; the imported payload IS the at-rest blob (no re-encryption needed).
   async importBackup({ payload, password, name }: { payload: BackupPayloadV1; password: string; name?: string }) {
-    const mnemonic = await decryptBackup(payload, password) // throws if wrong password
-    if (!validateMnemonic(mnemonic, wordlist)) throw new Error('Backup did not contain a valid recovery phrase')
-    const { privHex, pubHex } = deriveKeypair(mnemonic)
+    let secret: string
+    // WebCrypto throws a message-less DOMException on a bad password; surface a clear error.
+    try { secret = await decryptBackup(payload, password) }
+    catch { throw new Error('Wrong password — could not decrypt this backup') }
+    const { privHex, pubHex } = secretToKeypair(secret)    // mnemonic OR nsec/hex key
     await kvSet(acctKey(pubHex), payload)
     await upsertAccount({ pubkey: pubHex, npub: nip19.npubEncode(pubHex), name: name || null, createdAt: Math.floor(Date.now() / 1000) })
     await rateReset(pubHex)
@@ -177,11 +198,11 @@ const ops: Record<string, (p?: any) => Promise<unknown>> = {
     await rateGuard(pubkey)
     const blob = await getBlob(pubkey)
     if (!blob) throw new Error('No such account')
-    let mnemonic: string
-    try { mnemonic = await decryptBackup(blob, pin) }
+    let secret: string
+    try { secret = await decryptBackup(blob, pin) }
     catch { await rateFail(pubkey); throw new Error('Incorrect PIN') }
     await rateReset(pubkey)
-    unlockSession(deriveKeypair(mnemonic).privHex)
+    unlockSession(secretToKeypair(secret).privHex)
     return { pubkey: activePub }
   },
   async lock() { lock(); return { ok: true } },
