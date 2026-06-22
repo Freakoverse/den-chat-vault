@@ -19,7 +19,7 @@ import { generateMnemonic, mnemonicToSeedSync, validateMnemonic } from '@scure/b
 import { wordlist } from '@scure/bip39/wordlists/english'
 import { HDKey } from '@scure/bip32'
 import { bytesToHex, hexToBytes } from '@noble/hashes/utils'
-import { getPublicKey, finalizeEvent, nip04, nip44, type EventTemplate } from 'nostr-tools'
+import { getPublicKey, finalizeEvent, nip04, nip44, nip19, type EventTemplate } from 'nostr-tools'
 
 /* ─── Config (EDIT BEFORE DEPLOY) ─── */
 const ALLOWED_PARENT_ORIGINS = ['https://web.denchat.top']
@@ -89,9 +89,23 @@ async function kvSet(k: string, v: unknown): Promise<void> {
   })
 }
 
+/* ─── Account index (plaintext metadata; one encrypted blob per account) ─── */
+interface AccountMeta { pubkey: string; npub: string; name: string | null; createdAt: number }
+const acctKey = (pub: string) => `acct:${pub}`
+async function getAccounts(): Promise<AccountMeta[]> { return (await kvGet<AccountMeta[]>('accounts')) || [] }
+async function setAccounts(list: AccountMeta[]) { await kvSet('accounts', list) }
+async function upsertAccount(meta: AccountMeta) {
+  const list = await getAccounts()
+  const i = list.findIndex((a) => a.pubkey === meta.pubkey)
+  if (i >= 0) list[i] = { ...list[i], ...meta }
+  else list.push(meta)
+  await setAccounts(list)
+}
+function getBlob(pub: string) { return kvGet<BackupPayloadV1>(acctKey(pub)) }
+
 /* ─── Session (in-memory only; never persisted) ─── */
 let sessionPriv: Uint8Array | null = null
-let sessionPub: string | null = null
+let activePub: string | null = null
 let idleTimer: ReturnType<typeof setTimeout> | null = null
 function touchSession() {
   if (idleTimer) clearTimeout(idleTimer)
@@ -99,78 +113,98 @@ function touchSession() {
 }
 function unlockSession(privHex: string) {
   sessionPriv = hexToBytes(privHex)
-  sessionPub = getPublicKey(sessionPriv)
+  activePub = getPublicKey(sessionPriv)
+  void kvSet('active', activePub)
   touchSession()
 }
 function lock() {
   if (sessionPriv) sessionPriv.fill(0)
-  sessionPriv = null; sessionPub = null
+  sessionPriv = null; activePub = null
   if (idleTimer) { clearTimeout(idleTimer); idleTimer = null }
 }
 
-/* ─── Rate limiting (escalating backoff, persisted) ─── */
+/* ─── Rate limiting (per account, escalating, persisted) ─── */
 interface RateState { fails: number; lockedUntil: number }
-async function rateGuard(): Promise<void> {
-  const r = (await kvGet<RateState>('rate')) || { fails: 0, lockedUntil: 0 }
-  if (r.lockedUntil > Date.now()) throw new Error(`Too many attempts — wait ${Math.ceil((r.lockedUntil - Date.now()) / 1000)}s`)
+const rateKey = (pub: string) => `rate:${pub}`
+async function rateGuard(pub: string): Promise<void> {
+  const r = (await kvGet<RateState>(rateKey(pub))) || { fails: 0, lockedUntil: 0 }
+  if (r.lockedUntil > Date.now()) throw new Error(`Too many attempts. Wait ${Math.ceil((r.lockedUntil - Date.now()) / 1000)}s`)
 }
-async function rateFail(): Promise<void> {
-  const r = (await kvGet<RateState>('rate')) || { fails: 0, lockedUntil: 0 }
+async function rateFail(pub: string): Promise<void> {
+  const r = (await kvGet<RateState>(rateKey(pub))) || { fails: 0, lockedUntil: 0 }
   r.fails += 1
   const over = r.fails - RATE_FREE_ATTEMPTS
   if (over > 0) r.lockedUntil = Date.now() + (RATE_STEP_MS[Math.min(over - 1, RATE_STEP_MS.length - 1)])
-  await kvSet('rate', r)
+  await kvSet(rateKey(pub), r)
 }
-async function rateReset(): Promise<void> { await kvSet('rate', { fails: 0, lockedUntil: 0 }) }
+async function rateReset(pub: string): Promise<void> { await kvSet(rateKey(pub), { fails: 0, lockedUntil: 0 }) }
 
 /* ─── Operations ─── */
-async function getBlob() { return kvGet<BackupPayloadV1>('blob') }
-
 const ops: Record<string, (p?: any) => Promise<unknown>> = {
   async status() {
-    return { hasIdentity: !!(await getBlob()), unlocked: !!sessionPriv, pubkey: sessionPub }
+    return { accounts: await getAccounts(), active: (await kvGet<string>('active')) || null, unlocked: !!sessionPriv, pubkey: activePub }
   },
+  async listAccounts() { return getAccounts() },
   // Generate a fresh identity. Returns the mnemonic ONCE so the app can show the
-  // backup screen; nothing is stored until `saveNew` is called (after the user
-  // confirms they've backed it up). The pubkey is returned for display.
+  // backup screen; nothing is stored until `saveNew` is called.
   async generate() {
     const mnemonic = generateMnemonic(wordlist, 256)
-    const { pubHex } = deriveKeypair(mnemonic)
-    return { mnemonic, pubkey: pubHex }
+    return { mnemonic, pubkey: deriveKeypair(mnemonic).pubHex }
   },
-  // Persist a generated/known mnemonic, encrypted with `pin`, and unlock.
-  async saveNew({ mnemonic, pin }: { mnemonic: string; pin: string }) {
+  // Persist a generated/known mnemonic as a new account (encrypted with `pin`) and unlock.
+  async saveNew({ mnemonic, pin, name }: { mnemonic: string; pin: string; name?: string }) {
     if (!validateMnemonic(mnemonic, wordlist)) throw new Error('Invalid mnemonic')
     const { privHex, pubHex } = deriveKeypair(mnemonic)
-    await kvSet('blob', await encryptBackup(mnemonic, pin))
-    await rateReset()
+    await kvSet(acctKey(pubHex), await encryptBackup(mnemonic, pin))
+    await upsertAccount({ pubkey: pubHex, npub: nip19.npubEncode(pubHex), name: name || null, createdAt: Math.floor(Date.now() / 1000) })
+    await rateReset(pubHex)
     unlockSession(privHex)
     return { pubkey: pubHex }
   },
-  // Import an encrypted backup file (same format). Its password becomes the PIN;
-  // the imported payload IS the at-rest blob (no re-encryption needed).
-  async importBackup({ payload, password }: { payload: BackupPayloadV1; password: string }) {
+  // Import an encrypted backup file (same format). Its password becomes the account
+  // PIN; the imported payload IS the at-rest blob (no re-encryption needed).
+  async importBackup({ payload, password, name }: { payload: BackupPayloadV1; password: string; name?: string }) {
     const mnemonic = await decryptBackup(payload, password) // throws if wrong password
     if (!validateMnemonic(mnemonic, wordlist)) throw new Error('Backup did not contain a valid recovery phrase')
     const { privHex, pubHex } = deriveKeypair(mnemonic)
-    await kvSet('blob', payload)
-    await rateReset()
+    await kvSet(acctKey(pubHex), payload)
+    await upsertAccount({ pubkey: pubHex, npub: nip19.npubEncode(pubHex), name: name || null, createdAt: Math.floor(Date.now() / 1000) })
+    await rateReset(pubHex)
     unlockSession(privHex)
     return { pubkey: pubHex }
   },
-  async unlock({ pin }: { pin: string }) {
-    await rateGuard()
-    const blob = await getBlob()
-    if (!blob) throw new Error('No identity stored')
+  async unlock({ pubkey, pin }: { pubkey: string; pin: string }) {
+    await rateGuard(pubkey)
+    const blob = await getBlob(pubkey)
+    if (!blob) throw new Error('No such account')
     let mnemonic: string
     try { mnemonic = await decryptBackup(blob, pin) }
-    catch { await rateFail(); throw new Error('Incorrect PIN') }
-    await rateReset()
+    catch { await rateFail(pubkey); throw new Error('Incorrect PIN') }
+    await rateReset(pubkey)
     unlockSession(deriveKeypair(mnemonic).privHex)
-    return { pubkey: sessionPub }
+    return { pubkey: activePub }
   },
   async lock() { lock(); return { ok: true } },
-  async getPublicKey() { if (!sessionPub) throw new Error('Locked'); return sessionPub },
+  async removeAccount({ pubkey, pin }: { pubkey: string; pin: string }) {
+    const blob = await getBlob(pubkey)
+    if (!blob) return { ok: true }
+    try { await decryptBackup(blob, pin) } catch { await rateFail(pubkey); throw new Error('Incorrect PIN') }
+    await kvSet(acctKey(pubkey), undefined as unknown as BackupPayloadV1)
+    await setAccounts((await getAccounts()).filter((a) => a.pubkey !== pubkey))
+    await rateReset(pubkey)
+    if (activePub === pubkey) lock()
+    return { ok: true }
+  },
+  // Return an account's at-rest blob as a backup payload (PIN-gated).
+  async exportBackup({ pubkey, pin }: { pubkey: string; pin: string }) {
+    await rateGuard(pubkey)
+    const blob = await getBlob(pubkey)
+    if (!blob) throw new Error('No such account')
+    try { await decryptBackup(blob, pin) } catch { await rateFail(pubkey); throw new Error('Incorrect PIN') }
+    await rateReset(pubkey)
+    return { payload: blob }
+  },
+  async getPublicKey() { if (!activePub) throw new Error('Locked'); return activePub },
   async signEvent({ event }: { event: EventTemplate }) {
     if (!sessionPriv) throw new Error('Locked')
     touchSession()
@@ -193,15 +227,6 @@ const ops: Record<string, (p?: any) => Promise<unknown>> = {
     if (!sessionPriv) throw new Error('Locked'); touchSession()
     const conv = nip44.v2.utils.getConversationKey(sessionPriv, pubkey)
     return nip44.v2.decrypt(ciphertext, conv)
-  },
-  // Return the at-rest blob as a backup payload (PIN-gated: caller proves the PIN).
-  async exportBackup({ pin }: { pin: string }) {
-    await rateGuard()
-    const blob = await getBlob()
-    if (!blob) throw new Error('No identity stored')
-    try { await decryptBackup(blob, pin) } catch { await rateFail(); throw new Error('Incorrect PIN') }
-    await rateReset()
-    return { payload: blob }
   },
 }
 
@@ -234,17 +259,17 @@ async function runSelfTest() {
     line(`secure context: <span class="${window.isSecureContext ? 'ok' : 'fail'}">${window.isSecureContext}</span>`)
     const r = await ops.generate() as { mnemonic: string; pubkey: string }
     line('key generation: <span class="ok">ok</span>')
-    await ops.saveNew({ mnemonic: r.mnemonic, pin: '123456' })
+    await ops.saveNew({ mnemonic: r.mnemonic, pin: '123456', name: 'self-test' })
     line('encrypt + store (IndexedDB): <span class="ok">ok</span>')
     lock()
-    const back = await kvGet<BackupPayloadV1>('blob')
+    const back = await getBlob(r.pubkey)
     line(`read back from IndexedDB: <span class="${back ? 'ok' : 'fail'}">${back ? 'ok' : 'MISSING — storage blocked here'}</span>`)
-    await ops.unlock({ pin: '123456' })
+    await ops.unlock({ pubkey: r.pubkey, pin: '123456' })
     line('decrypt + unlock: <span class="ok">ok</span>')
     const ev = await ops.signEvent({ event: { kind: 1, created_at: 1, tags: [], content: 'vault self-test' } }) as { sig: string; pubkey: string }
     line(`sign event: <span class="${ev.sig?.length === 128 ? 'ok' : 'fail'}">${ev.sig?.length === 128 ? 'ok' : 'bad sig'}</span>`)
     // Cleanup the throwaway identity so the self-test leaves no key behind.
-    await kvSet('blob', undefined as unknown as BackupPayloadV1); await rateReset(); lock()
+    await ops.removeAccount({ pubkey: r.pubkey, pin: '123456' }); lock()
     line('<br><b class="ok">All checks passed — this origin can host the vault.</b>')
     line(`<span class="muted">pubkey: ${ev.pubkey}</span>`)
   } catch (err) {
