@@ -108,19 +108,37 @@ async function kvSet(k: string, v: unknown): Promise<void> {
   })
 }
 
-/* ─── Account index (plaintext metadata; one encrypted blob per account) ─── */
-interface AccountMeta { pubkey: string; npub: string; name: string | null; createdAt: number }
-const acctKey = (pub: string) => `acct:${pub}`
-async function getAccounts(): Promise<AccountMeta[]> { return (await kvGet<AccountMeta[]>('accounts')) || [] }
-async function setAccounts(list: AccountMeta[]) { await kvSet('accounts', list) }
+/* ─── Seeds + accounts (one PIN per seed; accounts are HD-derived from it) ─── */
+// A "seed" is a PIN-encrypted secret: a BIP-39 mnemonic (kind 'seed') or a single
+// nsec/hex key (kind 'key'). Accounts are plaintext metadata derived from a seed at
+// an index — a 'key' seed has exactly one account at index 0 and cannot derive more.
+interface SeedMeta { id: string; name: string | null; kind: 'seed' | 'key'; createdAt: number }
+interface AccountMeta { pubkey: string; npub: string; seedId: string; index: number; name: string | null; createdAt: number }
+const seedBlobKey = (id: string) => `seedblob:${id}`
+const now = () => Math.floor(Date.now() / 1000)
+
+async function getSeeds(): Promise<SeedMeta[]> { return (await kvGet<SeedMeta[]>('seeds')) || [] }
+async function setSeeds(list: SeedMeta[]) { await kvSet('seeds', list) }
+async function upsertSeed(meta: SeedMeta) {
+  const list = await getSeeds()
+  const i = list.findIndex((s) => s.id === meta.id)
+  if (i >= 0) list[i] = { ...list[i], ...meta }; else list.push(meta)
+  await setSeeds(list)
+}
+async function getAccounts(): Promise<AccountMeta[]> { return (await kvGet<AccountMeta[]>('accts')) || [] }
+async function setAccounts(list: AccountMeta[]) { await kvSet('accts', list) }
 async function upsertAccount(meta: AccountMeta) {
   const list = await getAccounts()
   const i = list.findIndex((a) => a.pubkey === meta.pubkey)
-  if (i >= 0) list[i] = { ...list[i], ...meta }
-  else list.push(meta)
+  if (i >= 0) list[i] = { ...list[i], ...meta }; else list.push(meta)
   await setAccounts(list)
 }
-function getBlob(pub: string) { return kvGet<BackupPayloadV1>(acctKey(pub)) }
+function getSeedBlob(id: string) { return kvGet<BackupPayloadV1>(seedBlobKey(id)) }
+
+/** Keypair from a stored secret at a derivation index (index ignored for single keys). */
+function keypairFromSecret(secret: string, index: number): { privHex: string; pubHex: string } {
+  return validateMnemonic(secret.trim(), wordlist) ? deriveKeypair(secret, index) : secretToKeypair(secret)
+}
 
 /* ─── Session (in-memory only; never persisted) ─── */
 let sessionPriv: Uint8Array | null = null
@@ -142,26 +160,26 @@ function lock() {
   if (idleTimer) { clearTimeout(idleTimer); idleTimer = null }
 }
 
-/* ─── Rate limiting (per account, escalating, persisted) ─── */
+/* ─── Rate limiting (per seed, escalating, persisted) ─── */
 interface RateState { fails: number; lockedUntil: number }
-const rateKey = (pub: string) => `rate:${pub}`
-async function rateGuard(pub: string): Promise<void> {
-  const r = (await kvGet<RateState>(rateKey(pub))) || { fails: 0, lockedUntil: 0 }
+const rateKey = (id: string) => `rate:${id}`
+async function rateGuard(id: string): Promise<void> {
+  const r = (await kvGet<RateState>(rateKey(id))) || { fails: 0, lockedUntil: 0 }
   if (r.lockedUntil > Date.now()) throw new Error(`Too many attempts. Wait ${Math.ceil((r.lockedUntil - Date.now()) / 1000)}s`)
 }
-async function rateFail(pub: string): Promise<void> {
-  const r = (await kvGet<RateState>(rateKey(pub))) || { fails: 0, lockedUntil: 0 }
+async function rateFail(id: string): Promise<void> {
+  const r = (await kvGet<RateState>(rateKey(id))) || { fails: 0, lockedUntil: 0 }
   r.fails += 1
   const over = r.fails - RATE_FREE_ATTEMPTS
   if (over > 0) r.lockedUntil = Date.now() + (RATE_STEP_MS[Math.min(over - 1, RATE_STEP_MS.length - 1)])
-  await kvSet(rateKey(pub), r)
+  await kvSet(rateKey(id), r)
 }
-async function rateReset(pub: string): Promise<void> { await kvSet(rateKey(pub), { fails: 0, lockedUntil: 0 }) }
+async function rateReset(id: string): Promise<void> { await kvSet(rateKey(id), { fails: 0, lockedUntil: 0 }) }
 
 /* ─── Operations ─── */
 const ops: Record<string, (p?: any) => Promise<unknown>> = {
   async status() {
-    return { accounts: await getAccounts(), active: (await kvGet<string>('active')) || null, unlocked: !!sessionPriv, pubkey: activePub }
+    return { seeds: await getSeeds(), accounts: await getAccounts(), active: (await kvGet<string>('active')) || null, unlocked: !!sessionPriv, pubkey: activePub }
   },
   async listAccounts() { return getAccounts() },
   // Generate a fresh identity. Returns the mnemonic ONCE so the app can show the
@@ -170,59 +188,92 @@ const ops: Record<string, (p?: any) => Promise<unknown>> = {
     const mnemonic = generateMnemonic(wordlist, 256)
     return { mnemonic, pubkey: deriveKeypair(mnemonic).pubHex }
   },
-  // Persist a generated/known mnemonic as a new account (encrypted with `pin`) and unlock.
+  // Persist a generated mnemonic as a new seed + its first account (index 0), encrypted with `pin`.
   async saveNew({ mnemonic, pin, name }: { mnemonic: string; pin: string; name?: string }) {
     if (!validateMnemonic(mnemonic, wordlist)) throw new Error('Invalid mnemonic')
-    const { privHex, pubHex } = deriveKeypair(mnemonic)
-    await kvSet(acctKey(pubHex), await encryptBackup(mnemonic, pin))
-    await upsertAccount({ pubkey: pubHex, npub: nip19.npubEncode(pubHex), name: name || null, createdAt: Math.floor(Date.now() / 1000) })
-    await rateReset(pubHex)
+    const { privHex, pubHex } = deriveKeypair(mnemonic, 0)
+    const seedId = pubHex
+    await kvSet(seedBlobKey(seedId), await encryptBackup(mnemonic, pin))
+    await upsertSeed({ id: seedId, name: name || null, kind: 'seed', createdAt: now() })
+    await upsertAccount({ pubkey: pubHex, npub: nip19.npubEncode(pubHex), seedId, index: 0, name: name || null, createdAt: now() })
+    await rateReset(seedId)
     unlockSession(privHex)
-    return { pubkey: pubHex }
+    return { pubkey: pubHex, seedId }
   },
-  // Import an encrypted backup file (same format). Its password becomes the account
-  // PIN; the imported payload IS the at-rest blob (no re-encryption needed).
+  // Import an encrypted backup (mnemonic OR nsec/hex key) as a new seed; its password
+  // becomes the seed PIN. The imported payload IS the at-rest blob (no re-encryption).
   async importBackup({ payload, password, name }: { payload: BackupPayloadV1; password: string; name?: string }) {
     let secret: string
     // WebCrypto throws a message-less DOMException on a bad password; surface a clear error.
     try { secret = await decryptBackup(payload, password) }
     catch { throw new Error('Wrong password — could not decrypt this backup') }
-    const { privHex, pubHex } = secretToKeypair(secret)    // mnemonic OR nsec/hex key
-    await kvSet(acctKey(pubHex), payload)
-    await upsertAccount({ pubkey: pubHex, npub: nip19.npubEncode(pubHex), name: name || null, createdAt: Math.floor(Date.now() / 1000) })
-    await rateReset(pubHex)
+    const isSeed = validateMnemonic(secret.trim(), wordlist)
+    const { privHex, pubHex } = keypairFromSecret(secret, 0)
+    const seedId = pubHex
+    await kvSet(seedBlobKey(seedId), payload)
+    await upsertSeed({ id: seedId, name: name || null, kind: isSeed ? 'seed' : 'key', createdAt: now() })
+    await upsertAccount({ pubkey: pubHex, npub: nip19.npubEncode(pubHex), seedId, index: 0, name: name || null, createdAt: now() })
+    await rateReset(seedId)
+    unlockSession(privHex)
+    return { pubkey: pubHex, seedId }
+  },
+  // Derive the next account from an existing seed (same PIN). Not allowed for single-key seeds.
+  async deriveAccount({ seedId, pin, name }: { seedId: string; pin: string; name?: string }) {
+    await rateGuard(seedId)
+    const blob = await getSeedBlob(seedId)
+    if (!blob) throw new Error('No such seed')
+    let mnemonic: string
+    try { mnemonic = await decryptBackup(blob, pin) }
+    catch { await rateFail(seedId); throw new Error('Incorrect PIN') }
+    if (!validateMnemonic(mnemonic.trim(), wordlist)) throw new Error('This identity is a single key and cannot derive more accounts')
+    await rateReset(seedId)
+    const used = (await getAccounts()).filter((a) => a.seedId === seedId).map((a) => a.index)
+    const index = (used.length ? Math.max(...used) : -1) + 1
+    const { privHex, pubHex } = deriveKeypair(mnemonic, index)
+    await upsertAccount({ pubkey: pubHex, npub: nip19.npubEncode(pubHex), seedId, index, name: name || null, createdAt: now() })
     unlockSession(privHex)
     return { pubkey: pubHex }
   },
   async unlock({ pubkey, pin }: { pubkey: string; pin: string }) {
-    await rateGuard(pubkey)
-    const blob = await getBlob(pubkey)
+    const acct = (await getAccounts()).find((a) => a.pubkey === pubkey)
+    if (!acct) throw new Error('No such account')
+    await rateGuard(acct.seedId)
+    const blob = await getSeedBlob(acct.seedId)
     if (!blob) throw new Error('No such account')
     let secret: string
     try { secret = await decryptBackup(blob, pin) }
-    catch { await rateFail(pubkey); throw new Error('Incorrect PIN') }
-    await rateReset(pubkey)
-    unlockSession(secretToKeypair(secret).privHex)
+    catch { await rateFail(acct.seedId); throw new Error('Incorrect PIN') }
+    await rateReset(acct.seedId)
+    unlockSession(keypairFromSecret(secret, acct.index).privHex)
     return { pubkey: activePub }
   },
   async lock() { lock(); return { ok: true } },
   async removeAccount({ pubkey, pin }: { pubkey: string; pin: string }) {
-    const blob = await getBlob(pubkey)
-    if (!blob) return { ok: true }
-    try { await decryptBackup(blob, pin) } catch { await rateFail(pubkey); throw new Error('Incorrect PIN') }
-    await kvSet(acctKey(pubkey), undefined as unknown as BackupPayloadV1)
-    await setAccounts((await getAccounts()).filter((a) => a.pubkey !== pubkey))
-    await rateReset(pubkey)
+    const accounts = await getAccounts()
+    const acct = accounts.find((a) => a.pubkey === pubkey)
+    if (!acct) return { ok: true }
+    const blob = await getSeedBlob(acct.seedId)
+    if (blob) { try { await decryptBackup(blob, pin) } catch { await rateFail(acct.seedId); throw new Error('Incorrect PIN') } }
+    const remaining = accounts.filter((a) => a.pubkey !== pubkey)
+    await setAccounts(remaining)
+    // If that was the seed's last account, drop the seed blob + meta + rate state too.
+    if (!remaining.some((a) => a.seedId === acct.seedId)) {
+      await kvSet(seedBlobKey(acct.seedId), undefined)
+      await setSeeds((await getSeeds()).filter((s) => s.id !== acct.seedId))
+      await rateReset(acct.seedId)
+    }
     if (activePub === pubkey) lock()
     return { ok: true }
   },
-  // Return an account's at-rest blob as a backup payload (PIN-gated).
+  // Return the account's seed blob as a backup payload (PIN-gated).
   async exportBackup({ pubkey, pin }: { pubkey: string; pin: string }) {
-    await rateGuard(pubkey)
-    const blob = await getBlob(pubkey)
+    const acct = (await getAccounts()).find((a) => a.pubkey === pubkey)
+    if (!acct) throw new Error('No such account')
+    await rateGuard(acct.seedId)
+    const blob = await getSeedBlob(acct.seedId)
     if (!blob) throw new Error('No such account')
-    try { await decryptBackup(blob, pin) } catch { await rateFail(pubkey); throw new Error('Incorrect PIN') }
-    await rateReset(pubkey)
+    try { await decryptBackup(blob, pin) } catch { await rateFail(acct.seedId); throw new Error('Incorrect PIN') }
+    await rateReset(acct.seedId)
     return { payload: blob }
   },
   async getPublicKey() { if (!activePub) throw new Error('Locked'); return activePub },
@@ -283,7 +334,7 @@ async function runSelfTest() {
     await ops.saveNew({ mnemonic: r.mnemonic, pin: '123456', name: 'self-test' })
     line('encrypt + store (IndexedDB): <span class="ok">ok</span>')
     lock()
-    const back = await getBlob(r.pubkey)
+    const back = await getSeedBlob(r.pubkey)   // seedId === pubkey for the index-0 account
     line(`read back from IndexedDB: <span class="${back ? 'ok' : 'fail'}">${back ? 'ok' : 'MISSING — storage blocked here'}</span>`)
     await ops.unlock({ pubkey: r.pubkey, pin: '123456' })
     line('decrypt + unlock: <span class="ok">ok</span>')
