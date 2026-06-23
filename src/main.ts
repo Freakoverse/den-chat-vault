@@ -20,6 +20,8 @@ import { wordlist } from '@scure/bip39/wordlists/english'
 import { HDKey } from '@scure/bip32'
 import { bytesToHex, hexToBytes } from '@noble/hashes/utils'
 import { getPublicKey, finalizeEvent, nip04, nip44, nip19, type EventTemplate } from 'nostr-tools'
+import { createTaprootTransaction, createSegwitTransaction, type UTXO } from './btc-tx'
+import { signEvmTransaction, getEvmSigningKey, type EvmChain } from './evm-tx'
 
 /* ─── Config (EDIT BEFORE DEPLOY) ─── */
 const ALLOWED_PARENT_ORIGINS = ['https://web.denchat.top']
@@ -315,6 +317,27 @@ const ops: Record<string, (p?: any) => Promise<unknown>> = {
     touchSession()
     return finalizeEvent(event, sessionPriv)
   },
+  // Build + sign a blockchain transaction from STRUCTURED params (the vault derives the
+  // sighash itself, so the in-vault confirm can't be forged). Returns the signed raw hex.
+  // NOTE: PIN-confirm gating is added in the next stage; for now this signs with the session key.
+  async signTransaction({ chain, tx }: { chain: string; tx: any }) {
+    if (!sessionPriv) throw new Error('Locked')
+    touchSession()
+    const privHex = bytesToHex(sessionPriv)
+    if (chain === 'bitcoin') {
+      const utxos = tx.utxos as UTXO[]
+      const args = [privHex, utxos, tx.recipientAddress as string, BigInt(tx.amountSats), Number(tx.feeRate)] as const
+      const signed = tx.addressType === 'segwit' ? createSegwitTransaction(...args) : createTaprootTransaction(...args)
+      return { signed }
+    }
+    // EVM — getEvmSigningKey handles even-y negation for nostr-mode addresses.
+    const signingKeyHex = getEvmSigningKey(privHex, tx.addressMode === 'standard' ? 'standard' : 'nostr')
+    const signed = signEvmTransaction(
+      { chain: chain as EvmChain, to: tx.to, value: BigInt(tx.value), data: tx.data as Uint8Array | undefined, gasLimit: BigInt(tx.gasLimit), gasPrice: BigInt(tx.gasPrice), nonce: BigInt(tx.nonce) },
+      signingKeyHex,
+    )
+    return { signed }
+  },
   async nip04Encrypt({ pubkey, plaintext }: { pubkey: string; plaintext: string }) {
     if (!sessionPriv) throw new Error('Locked'); touchSession()
     return nip04.encrypt(sessionPriv, pubkey, plaintext)
@@ -373,6 +396,17 @@ async function runSelfTest() {
     line('decrypt + unlock: <span class="ok">ok</span>')
     const ev = await ops.signEvent({ event: { kind: 1, created_at: 1, tags: [], content: 'vault self-test' } }) as { sig: string; pubkey: string }
     line(`sign event: <span class="${ev.sig?.length === 128 ? 'ok' : 'fail'}">${ev.sig?.length === 128 ? 'ok' : 'bad sig'}</span>`)
+
+    // ── Blockchain tx signing (deterministic ECDSA vector + BTC build) ──
+    const EVM_VECTOR = '0xf86b058504a817c8008252089452908400098527886e0f7030069857d2e4169ee787038d7ea4c680008025a0174aea4ca40a8116f3ba437ce057e596accbf9c8f1b2a5bee581b8df05da5004a02de4af3baeba239ed92e36f73da03afd5eb850510c05dfcdc223da040c455ee9'
+    const evmKey = '0000000000000000000000000000000000000000000000000000000000000001'
+    const evmSigned = signEvmTransaction({ chain: 'ethereum', to: '0x52908400098527886e0f7030069857d2e4169ee7', value: 1000000000000000n, gasLimit: 21000n, gasPrice: 20000000000n, nonce: 5n }, evmKey)
+    line(`EVM tx signing: <span class="${evmSigned === EVM_VECTOR ? 'ok' : 'fail'}">${evmSigned === EVM_VECTOR ? 'ok (matches reference)' : 'MISMATCH — crypto differs from app'}</span>`)
+    const btcUtxos: UTXO[] = [{ txid: '00'.repeat(32), vout: 0, value: 100000, status: { confirmed: true } }]
+    const btcSigned = createTaprootTransaction(evmKey, btcUtxos, 'bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr', 50000n, 5)
+    const btcOk = /^[0-9a-f]+$/.test(btcSigned) && btcSigned.length > 150
+    line(`BTC taproot signing: <span class="${btcOk ? 'ok' : 'fail'}">${btcOk ? 'ok (valid tx built)' : 'FAIL'}</span>`)
+
     // Cleanup the throwaway identity so the self-test leaves no key behind.
     await ops.removeAccount({ pubkey: r.pubkey, pin: '123456' }); lock()
     line('<br><b class="ok">All checks passed — this origin can host the vault.</b>')
