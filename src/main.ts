@@ -194,8 +194,8 @@ const ops: Record<string, (p?: any) => Promise<unknown>> = {
     const { privHex, pubHex } = deriveKeypair(mnemonic, 0)
     const seedId = pubHex
     await kvSet(seedBlobKey(seedId), await encryptBackup(mnemonic, pin))
-    await upsertSeed({ id: seedId, name: name || null, kind: 'seed', hint: hint || null, createdAt: now() })
-    await upsertAccount({ pubkey: pubHex, npub: nip19.npubEncode(pubHex), seedId, index: 0, name: name || null, createdAt: now() })
+    await upsertSeed({ id: seedId, name: name || 'My Seed', kind: 'seed', hint: hint || null, createdAt: now() })
+    await upsertAccount({ pubkey: pubHex, npub: nip19.npubEncode(pubHex), seedId, index: 0, name: null, createdAt: now() })
     await rateReset(seedId)
     unlockSession(privHex)
     return { pubkey: pubHex, seedId }
@@ -211,8 +211,9 @@ const ops: Record<string, (p?: any) => Promise<unknown>> = {
     const { privHex, pubHex } = keypairFromSecret(secret, 0)
     const seedId = pubHex
     await kvSet(seedBlobKey(seedId), payload)
-    await upsertSeed({ id: seedId, name: name || null, kind: isSeed ? 'seed' : 'key', hint: hint || null, createdAt: now() })
-    await upsertAccount({ pubkey: pubHex, npub: nip19.npubEncode(pubHex), seedId, index: 0, name: name || null, createdAt: now() })
+    // A seed gets a label (default "My Seed"); a single key labels its standalone account.
+    await upsertSeed({ id: seedId, name: isSeed ? (name || 'My Seed') : (name || null), kind: isSeed ? 'seed' : 'key', hint: hint || null, createdAt: now() })
+    await upsertAccount({ pubkey: pubHex, npub: nip19.npubEncode(pubHex), seedId, index: 0, name: isSeed ? null : (name || null), createdAt: now() })
     await rateReset(seedId)
     unlockSession(privHex)
     return { pubkey: pubHex, seedId }
