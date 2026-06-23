@@ -217,16 +217,21 @@ interface TxDisplay { title: string; rows: Array<[string, string]> }
 function confirmAndSign(acct: AccountMeta, d: TxDisplay, sign: (privHex: string) => string): Promise<{ signed: string }> {
   showTxOverlay(true)
   const el = document.createElement('div')
-  el.style.cssText = 'position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:24px;background:#0b0e14;color:#e6e8eb;font:14px/1.5 system-ui,-apple-system,sans-serif;z-index:2147483647'
-  const rows = d.rows.map(([k, v]) => `<div style="display:flex;justify-content:space-between;gap:16px;width:100%"><span style="color:#8b93a1;flex-shrink:0">${esc(k)}</span><span style="font-weight:600;text-align:right;word-break:break-all">${esc(v)}</span></div>`).join('')
+  // Dimmed, blurred backdrop — the app shows through behind it, so this reads as an
+  // in-app modal rather than a separate page (the card below is the only opaque part).
+  el.style.cssText = 'position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:16px;background:rgba(6,8,12,0.62);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);color:#e6e8eb;font:14px/1.5 system-ui,-apple-system,sans-serif;z-index:2147483647;box-sizing:border-box'
+  const rows = d.rows.map(([k, v]) => `<div style="display:flex;justify-content:space-between;gap:16px"><span style="color:#8b93a1;flex-shrink:0">${esc(k)}</span><span style="font-weight:600;text-align:right;word-break:break-all">${esc(v)}</span></div>`).join('')
   el.innerHTML = `
-    <div style="font-size:18px;font-weight:700">${esc(d.title)}</div>
-    <div style="display:flex;flex-direction:column;gap:10px;width:100%;max-width:380px;background:#141925;border:1px solid #232b3a;border-radius:12px;padding:14px">${rows}</div>
-    <input id="v-pin" type="password" inputmode="numeric" placeholder="Enter PIN to sign" style="width:100%;max-width:380px;height:44px;border-radius:10px;border:1px solid #232b3a;background:#0f1420;color:#e6e8eb;padding:0 12px;font-size:16px;box-sizing:border-box" />
-    <div id="v-err" style="color:#f87171;font-size:12px;min-height:16px"></div>
-    <div style="display:flex;gap:8px;width:100%;max-width:380px">
-      <button id="v-cancel" style="flex:1;height:44px;border-radius:10px;border:1px solid #232b3a;background:#141925;color:#e6e8eb;cursor:pointer;font-size:14px">Cancel</button>
-      <button id="v-ok" style="flex:1;height:44px;border-radius:10px;border:0;background:#3b82f6;color:#fff;font-weight:600;cursor:pointer;font-size:14px">Confirm &amp; Sign</button>
+    <div style="width:100%;max-width:400px;display:flex;flex-direction:column;gap:14px;background:#0f1420;border:1px solid #232b3a;border-radius:18px;padding:20px;box-shadow:0 24px 70px rgba(0,0,0,0.55);box-sizing:border-box">
+      <div style="display:flex;align-items:center;gap:7px;color:#8b93a1;font-size:11px;font-weight:600;letter-spacing:.05em;text-transform:uppercase"><span style="font-size:13px">🔒</span> DEN Vault · Secure confirm</div>
+      <div style="font-size:18px;font-weight:700">${esc(d.title)}</div>
+      <div style="display:flex;flex-direction:column;gap:10px;background:#141925;border:1px solid #232b3a;border-radius:12px;padding:14px">${rows}</div>
+      <input id="v-pin" type="password" inputmode="numeric" placeholder="Enter PIN to sign" style="width:100%;height:46px;border-radius:12px;border:1px solid #232b3a;background:#0b0e14;color:#e6e8eb;padding:0 14px;font-size:16px;box-sizing:border-box" />
+      <div id="v-err" style="color:#f87171;font-size:12px;min-height:16px"></div>
+      <div style="display:flex;gap:10px">
+        <button id="v-cancel" style="flex:1;height:46px;border-radius:12px;border:1px solid #232b3a;background:#141925;color:#e6e8eb;cursor:pointer;font-size:14px">Cancel</button>
+        <button id="v-ok" style="flex:1.4;height:46px;border-radius:12px;border:0;background:#3b82f6;color:#fff;font-weight:600;cursor:pointer;font-size:14px">Confirm &amp; Sign</button>
+      </div>
     </div>`
   document.body.appendChild(el)
   const pinInput = el.querySelector('#v-pin') as HTMLInputElement
@@ -468,6 +473,10 @@ window.addEventListener('message', async (e: MessageEvent) => {
 
 // Tell the parent we're ready (only the allowlisted parent will be listening).
 if (window.parent !== window) {
+  // Embedded as the app's iframe: drop the body background so the tx-confirm overlay
+  // can show the app behind it (looks like a native in-app modal, not a separate page).
+  document.documentElement.style.background = 'transparent'
+  document.body.style.background = 'transparent'
   for (const origin of ALLOWED_PARENT_ORIGINS) window.parent.postMessage({ type: 'vault-ready' }, origin)
 }
 
