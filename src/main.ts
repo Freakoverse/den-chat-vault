@@ -278,6 +278,37 @@ const ops: Record<string, (p?: any) => Promise<unknown>> = {
     await rateReset(acct.seedId)
     return { payload: blob }
   },
+  async renameSeed({ seedId, name }: { seedId: string; name: string }) {
+    const seeds = await getSeeds()
+    const s = seeds.find((x) => x.id === seedId)
+    if (s) { s.name = name; await setSeeds(seeds) }
+    return { ok: true }
+  },
+  async renameAccount({ pubkey, name }: { pubkey: string; name: string }) {
+    const accounts = await getAccounts()
+    const a = accounts.find((x) => x.pubkey === pubkey)
+    if (a) { a.name = name; await setAccounts(accounts) }
+    return { ok: true }
+  },
+  // Change a seed's PIN (re-encrypt its blob). PIN is per-seed, so this covers all its accounts.
+  async changePin({ pubkey, currentPin, newPin, newHint }: { pubkey: string; currentPin: string; newPin: string; newHint?: string }) {
+    const acct = (await getAccounts()).find((a) => a.pubkey === pubkey)
+    if (!acct) throw new Error('No such account')
+    await rateGuard(acct.seedId)
+    const blob = await getSeedBlob(acct.seedId)
+    if (!blob) throw new Error('No such account')
+    let secret: string
+    try { secret = await decryptBackup(blob, currentPin) }
+    catch { await rateFail(acct.seedId); throw new Error('Incorrect PIN') }
+    await rateReset(acct.seedId)
+    await kvSet(seedBlobKey(acct.seedId), await encryptBackup(secret, newPin))
+    if (newHint !== undefined) {
+      const seeds = await getSeeds()
+      const s = seeds.find((x) => x.id === acct.seedId)
+      if (s) { s.hint = newHint || null; await setSeeds(seeds) }
+    }
+    return { ok: true }
+  },
   async getPublicKey() { if (!activePub) throw new Error('Locked'); return activePub },
   async signEvent({ event }: { event: EventTemplate }) {
     if (!sessionPriv) throw new Error('Locked')
