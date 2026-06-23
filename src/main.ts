@@ -178,6 +178,87 @@ async function rateFail(id: string): Promise<void> {
 }
 async function rateReset(id: string): Promise<void> { await kvSet(rateKey(id), { fails: 0, lockedUntil: 0 }) }
 
+/* ─── In-vault transaction confirmation (rendered in the isolated overlay) ─── */
+// Ask the parent to make this iframe a full-screen overlay (or hide it again).
+function showTxOverlay(show: boolean) {
+  if (window.parent === window) return
+  for (const o of ALLOWED_PARENT_ORIGINS) window.parent.postMessage({ type: 'vault-overlay', show }, o)
+}
+
+function esc(s: string): string {
+  return s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c] as string))
+}
+
+/** Format an integer `value` with `decimals` places, trimming trailing zeros. */
+function formatUnits(value: bigint, decimals: number): string {
+  const s = value.toString().padStart(decimals + 1, '0')
+  const intPart = s.slice(0, s.length - decimals)
+  let frac = decimals ? s.slice(s.length - decimals).replace(/0+$/, '') : ''
+  return frac ? `${intPart}.${frac}` : intPart
+}
+
+/** Decode an ERC-20 transfer(address,uint256) calldata → real recipient + amount. */
+function decodeErc20(data: Uint8Array): { to: string; amount: bigint } | null {
+  if (data.length !== 68) return null
+  if (!(data[0] === 0xa9 && data[1] === 0x05 && data[2] === 0x9c && data[3] === 0xbb)) return null
+  const to = '0x' + bytesToHex(data.slice(16, 36))
+  let amount = 0n
+  for (const b of data.slice(36, 68)) amount = (amount << 8n) | BigInt(b)
+  return { to, amount }
+}
+
+interface TxDisplay { title: string; rows: Array<[string, string]> }
+
+/**
+ * Render the confirm UI from vault-computed display rows, collect the PIN, and on
+ * "Confirm" verify it (re-derive the key) + sign. Rejects on cancel. The displayed
+ * details are derived by the vault from the structured tx, so they can't be forged.
+ */
+function confirmAndSign(acct: AccountMeta, d: TxDisplay, sign: (privHex: string) => string): Promise<{ signed: string }> {
+  showTxOverlay(true)
+  const el = document.createElement('div')
+  el.style.cssText = 'position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:24px;background:#0b0e14;color:#e6e8eb;font:14px/1.5 system-ui,-apple-system,sans-serif;z-index:2147483647'
+  const rows = d.rows.map(([k, v]) => `<div style="display:flex;justify-content:space-between;gap:16px;width:100%"><span style="color:#8b93a1;flex-shrink:0">${esc(k)}</span><span style="font-weight:600;text-align:right;word-break:break-all">${esc(v)}</span></div>`).join('')
+  el.innerHTML = `
+    <div style="font-size:18px;font-weight:700">${esc(d.title)}</div>
+    <div style="display:flex;flex-direction:column;gap:10px;width:100%;max-width:380px;background:#141925;border:1px solid #232b3a;border-radius:12px;padding:14px">${rows}</div>
+    <input id="v-pin" type="password" inputmode="numeric" placeholder="Enter PIN to sign" style="width:100%;max-width:380px;height:44px;border-radius:10px;border:1px solid #232b3a;background:#0f1420;color:#e6e8eb;padding:0 12px;font-size:16px;box-sizing:border-box" />
+    <div id="v-err" style="color:#f87171;font-size:12px;min-height:16px"></div>
+    <div style="display:flex;gap:8px;width:100%;max-width:380px">
+      <button id="v-cancel" style="flex:1;height:44px;border-radius:10px;border:1px solid #232b3a;background:#141925;color:#e6e8eb;cursor:pointer;font-size:14px">Cancel</button>
+      <button id="v-ok" style="flex:1;height:44px;border-radius:10px;border:0;background:#3b82f6;color:#fff;font-weight:600;cursor:pointer;font-size:14px">Confirm &amp; Sign</button>
+    </div>`
+  document.body.appendChild(el)
+  const pinInput = el.querySelector('#v-pin') as HTMLInputElement
+  const errEl = el.querySelector('#v-err') as HTMLDivElement
+  const okBtn = el.querySelector('#v-ok') as HTMLButtonElement
+  pinInput.focus()
+  return new Promise<{ signed: string }>((resolve, reject) => {
+    const close = () => { el.remove(); showTxOverlay(false) }
+    okBtn.onclick = async () => {
+      const pin = pinInput.value
+      if (!pin) { errEl.textContent = 'Enter your PIN'; return }
+      okBtn.disabled = true
+      try {
+        await rateGuard(acct.seedId)
+        const blob = await getSeedBlob(acct.seedId)
+        if (!blob) throw new Error('No account')
+        let secret: string
+        try { secret = await decryptBackup(blob, pin) }
+        catch { await rateFail(acct.seedId); errEl.textContent = 'Incorrect PIN'; pinInput.value = ''; pinInput.focus(); okBtn.disabled = false; return }
+        await rateReset(acct.seedId)
+        const { privHex } = keypairFromSecret(secret, acct.index)
+        const signed = sign(privHex)
+        close(); resolve({ signed })
+      } catch (e) {
+        errEl.textContent = e instanceof Error ? e.message : 'Signing failed'; okBtn.disabled = false
+      }
+    }
+    ;(el.querySelector('#v-cancel') as HTMLButtonElement).onclick = () => { close(); reject(new Error('Transaction cancelled')) }
+    pinInput.onkeydown = (e) => { if (e.key === 'Enter') okBtn.click() }
+  })
+}
+
 /* ─── Operations ─── */
 const ops: Record<string, (p?: any) => Promise<unknown>> = {
   async status() {
@@ -321,22 +402,37 @@ const ops: Record<string, (p?: any) => Promise<unknown>> = {
   // sighash itself, so the in-vault confirm can't be forged). Returns the signed raw hex.
   // NOTE: PIN-confirm gating is added in the next stage; for now this signs with the session key.
   async signTransaction({ chain, tx }: { chain: string; tx: any }) {
-    if (!sessionPriv) throw new Error('Locked')
-    touchSession()
-    const privHex = bytesToHex(sessionPriv)
+    if (!activePub) throw new Error('Locked')
+    const acct = (await getAccounts()).find((a) => a.pubkey === activePub)
+    if (!acct) throw new Error('No active account')
+
+    let display: TxDisplay
+    let sign: (privHex: string) => string
+
     if (chain === 'bitcoin') {
       const utxos = tx.utxos as UTXO[]
-      const args = [privHex, utxos, tx.recipientAddress as string, BigInt(tx.amountSats), Number(tx.feeRate)] as const
-      const signed = tx.addressType === 'segwit' ? createSegwitTransaction(...args) : createTaprootTransaction(...args)
-      return { signed }
+      const amountSats = BigInt(tx.amountSats)
+      display = {
+        title: 'Send Bitcoin',
+        rows: [['Amount', `${formatUnits(amountSats, 8)} BTC`], ['To', tx.recipientAddress as string], ['Fee rate', `${Number(tx.feeRate)} sat/vB`]],
+      }
+      sign = (privHex) => {
+        const args = [privHex, utxos, tx.recipientAddress as string, amountSats, Number(tx.feeRate)] as const
+        return tx.addressType === 'segwit' ? createSegwitTransaction(...args) : createTaprootTransaction(...args)
+      }
+    } else {
+      const data = tx.data as Uint8Array | undefined
+      const erc20 = data ? decodeErc20(data) : null
+      display = erc20
+        ? { title: `Send token (${chain})`, rows: [['Amount (raw)', erc20.amount.toString()], ['To', erc20.to], ['Token contract', tx.to as string]] }
+        : { title: `Send on ${chain}`, rows: [['Amount', `${formatUnits(BigInt(tx.value), 18)} (native)`], ['To', tx.to as string]] }
+      // getEvmSigningKey handles even-y negation for nostr-mode addresses.
+      sign = (privHex) => signEvmTransaction(
+        { chain: chain as EvmChain, to: tx.to, value: BigInt(tx.value), data, gasLimit: BigInt(tx.gasLimit), gasPrice: BigInt(tx.gasPrice), nonce: BigInt(tx.nonce) },
+        getEvmSigningKey(privHex, tx.addressMode === 'standard' ? 'standard' : 'nostr'),
+      )
     }
-    // EVM — getEvmSigningKey handles even-y negation for nostr-mode addresses.
-    const signingKeyHex = getEvmSigningKey(privHex, tx.addressMode === 'standard' ? 'standard' : 'nostr')
-    const signed = signEvmTransaction(
-      { chain: chain as EvmChain, to: tx.to, value: BigInt(tx.value), data: tx.data as Uint8Array | undefined, gasLimit: BigInt(tx.gasLimit), gasPrice: BigInt(tx.gasPrice), nonce: BigInt(tx.nonce) },
-      signingKeyHex,
-    )
-    return { signed }
+    return confirmAndSign(acct, display, sign)
   },
   async nip04Encrypt({ pubkey, plaintext }: { pubkey: string; plaintext: string }) {
     if (!sessionPriv) throw new Error('Locked'); touchSession()
