@@ -1,0 +1,91 @@
+@import "tailwindcss";
+
+/* Map the app's token names onto Tailwind colors (same as the main app). */
+@theme inline {
+  --color-background: hsl(var(--background));
+  --color-foreground: hsl(var(--foreground));
+  --color-card: hsl(var(--card));
+  --color-card-foreground: hsl(var(--card-foreground));
+  --color-popover: hsl(var(--popover));
+  --color-popover-foreground: hsl(var(--popover-foreground));
+  --color-primary: hsl(var(--primary));
+  --color-primary-foreground: hsl(var(--primary-foreground));
+  --color-secondary: hsl(var(--secondary));
+  --color-secondary-foreground: hsl(var(--secondary-foreground));
+  --color-muted: hsl(var(--muted));
+  --color-muted-foreground: hsl(var(--muted-foreground));
+  --color-destructive: hsl(var(--destructive));
+  --color-destructive-foreground: hsl(var(--destructive-foreground));
+  --color-border: hsl(var(--border));
+  --color-input: hsl(var(--input));
+  --color-ring: hsl(var(--ring));
+  --radius-lg: var(--radius);
+}
+
+/* The vault overlay is always dark — use the app's DARK token values on :root. */
+:root {
+  --background: 0 0% 9%;
+  --foreground: 0 0% 98%;
+  --card: 0 0% 9%;
+  --card-foreground: 0 0% 98%;
+  --popover: 0 0% 9%;
+  --popover-foreground: 0 0% 98%;
+  --primary: 228 92% 63%;
+  --primary-foreground: 0 0% 98%;
+  --secondary: 240 3.7% 15.9%;
+  --secondary-foreground: 0 0% 98%;
+  --muted: 240 3.7% 15.9%;
+  --muted-foreground: 240 5% 64.9%;
+  --destructive: 0 85% 60%;
+  --destructive-foreground: 0 0% 98%;
+  --border: 240 3.7% 15.9%;
+  --input: 240 3.7% 15.9%;
+  --ring: 228 92% 63%;
+  --radius: 0.5rem;
+}
+
+/* ── Vault overlay component classes (match the app's look, centralized) ── */
+@layer components {
+  .v-backdrop {
+    @apply fixed inset-0 flex items-center justify-center p-4 box-border text-foreground;
+    z-index: 2147483647;
+    background: rgba(0, 0, 0, 0.6);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    font: 14px/1.5 system-ui, -apple-system, sans-serif;
+  }
+  .v-card {
+    @apply w-full max-w-[420px] max-h-[92vh] overflow-y-auto flex flex-col gap-4 bg-popover border border-border rounded-2xl p-6 box-border;
+    box-shadow: 0 24px 70px rgba(0, 0, 0, 0.6);
+  }
+  .v-card > * { @apply shrink-0; }
+  .v-eyebrow { @apply text-[11px] font-semibold tracking-[0.06em] uppercase text-muted-foreground; }
+  .v-title { @apply text-lg font-bold text-foreground; }
+  .v-note { @apply text-[13px] text-muted-foreground leading-relaxed; }
+  .v-inset { @apply flex flex-col gap-2.5 bg-secondary/40 border border-border rounded-xl p-3.5; }
+  .v-input {
+    @apply w-full h-12 rounded-xl border border-input bg-secondary/40 text-foreground px-3.5 text-base outline-none box-border;
+  }
+  .v-textarea {
+    @apply w-full h-[88px] rounded-xl border border-input bg-secondary/40 text-foreground px-3.5 py-2.5 text-base outline-none box-border resize-none;
+    font-family: inherit;
+  }
+  .v-input:focus, .v-textarea:focus { @apply border-primary; }
+  .v-input::placeholder, .v-textarea::placeholder { @apply text-muted-foreground/70; }
+  .v-row { @apply flex gap-2.5; }
+  .v-btn {
+    @apply h-12 rounded-xl border border-border bg-secondary/40 text-foreground text-sm cursor-pointer flex items-center justify-center px-4;
+  }
+  .v-btn:disabled { @apply opacity-60 cursor-default; }
+  .v-btn-primary {
+    @apply h-12 rounded-xl border-0 bg-primary text-primary-foreground font-semibold text-sm cursor-pointer flex items-center justify-center px-4;
+  }
+  .v-grow { @apply flex-1; }
+  .v-grow-lg { flex: 1.4; }
+  .v-chip {
+    @apply inline-flex gap-1.5 items-baseline bg-popover border border-border rounded-lg px-2.5 py-2 text-[13px] font-semibold text-foreground whitespace-nowrap;
+  }
+  .v-chip-n { @apply text-[10px] font-normal text-muted-foreground; }
+  .v-err { @apply text-destructive text-xs min-h-4; }
+  .v-words { @apply flex flex-wrap gap-2; }
+}

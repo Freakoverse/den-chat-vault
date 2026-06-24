@@ -15,6 +15,7 @@
  * audited — it's the trusted surface for the key.
  */
 
+import './index.css'
 import { generateMnemonic, mnemonicToSeedSync, validateMnemonic } from '@scure/bip39'
 import { wordlist } from '@scure/bip39/wordlists/english'
 import { HDKey } from '@scure/bip32'
@@ -209,33 +210,24 @@ function decodeErc20(data: Uint8Array): { to: string; amount: bigint } | null {
 
 interface TxDisplay { title: string; rows: Array<[string, string]> }
 
-/* ─── Shared overlay styling (matches the app's dark theme tokens) ─── */
-const BACKDROP_CSS = 'position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:16px;background:rgba(0,0,0,0.6);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);color:#fafafa;font:14px/1.5 system-ui,-apple-system,sans-serif;z-index:2147483647;box-sizing:border-box'
-const CARD_CSS = 'width:100%;max-width:420px;max-height:92vh;overflow-y:auto;display:flex;flex-direction:column;gap:18px;background:#171717;border:1px solid #27272a;border-radius:20px;padding:24px;box-shadow:0 24px 70px rgba(0,0,0,0.6);box-sizing:border-box'
-const EYEBROW_CSS = 'color:#a1a1aa;font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase'
-const TITLE_CSS = 'font-size:18px;font-weight:700;color:#fafafa'
-const INPUT_CSS = 'width:100%;height:52px;border-radius:12px;border:1px solid #3f3f46;background:#1d1d20;color:#fafafa;padding:0 14px;font-size:16px;outline:none;box-sizing:border-box'
-const ERR_CSS = 'color:#f87171;font-size:12px;min-height:16px'
-const BTN_CANCEL_CSS = 'flex:1;height:52px;border-radius:12px;border:1px solid #2a2a2e;background:#1d1d20;color:#fafafa;cursor:pointer;font-size:14px'
-const BTN_OK_CSS = 'flex:1.4;height:52px;border-radius:12px;border:0;background:#4a6df7;color:#fafafa;font-weight:600;cursor:pointer;font-size:14px'
-const FOCUS_STYLE = '<style>.v-in:focus{border-color:#4a6df7}.v-in::placeholder{color:#71717a}</style>'
-const inset = (html: string) => `<div style="display:flex;flex-direction:column;gap:10px;background:#1d1d20;border:1px solid #2a2a2e;border-radius:12px;padding:14px">${html}</div>`
+/* ─── Shared overlay building blocks (styled via .v-* classes in index.css) ─── */
+const inset = (html: string) => `<div class="v-inset">${html}</div>`
 
 /** Numbered word chips that wrap as whole units — each chip sizes to its word, never clipped. */
 function wordChips(words: string[]): string {
-  return `<div style="display:flex;flex-wrap:wrap;gap:8px">${words.map((w, i) => `<span style="display:inline-flex;gap:6px;align-items:baseline;background:#171717;border:1px solid #2a2a2e;border-radius:8px;padding:8px 11px;font-size:13px;white-space:nowrap"><span style="color:#71717a;font-size:10px">${i + 1}</span><span style="font-weight:600;color:#fafafa">${esc(w)}</span></span>`).join('')}</div>`
+  return `<div class="v-words">${words.map((w, i) => `<span class="v-chip"><span class="v-chip-n">${i + 1}</span>${esc(w)}</span>`).join('')}</div>`
 }
 
 /** Wrap secret content (phrase/nsec) in a blurred box behind a "make sure no one is watching"
  *  cover + a Reveal button with a short countdown — mirrors the app's reveal flow. */
 function revealBlock(innerHtml: string): string {
-  return `<div style="position:relative">
-      <div id="v-secret-box" style="background:#1d1d20;border:1px solid #2a2a2e;border-radius:12px;padding:16px;max-height:46vh;overflow:auto;filter:blur(8px);user-select:none;transition:filter .25s">${innerHtml}</div>
-      <div id="v-cover" style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;text-align:center;padding:20px;background:rgba(23,23,23,0.66);border-radius:12px">
-        <div style="font-size:14px;color:#fafafa;font-weight:600">Reveal your secret?</div>
-        <div style="font-size:12px;color:#a1a1aa;max-width:260px;line-height:1.5">Make sure no one is watching your screen and nothing is recording.</div>
-        <button id="v-reveal" style="${BTN_OK_CSS};width:auto;flex:none;padding:0 22px;height:46px">Reveal</button>
-        <button id="v-reveal-cancel" style="${BTN_CANCEL_CSS};width:auto;flex:none;padding:0 18px;height:42px;display:none">No, wait</button>
+  return `<div class="relative">
+      <div id="v-secret-box" class="v-inset max-h-[46vh] overflow-auto select-none blur-md transition-[filter] duration-200">${innerHtml}</div>
+      <div id="v-cover" class="absolute inset-0 flex flex-col items-center justify-center gap-3 text-center p-5 rounded-xl bg-popover/70">
+        <div class="text-sm font-semibold text-foreground">Reveal your secret?</div>
+        <div class="text-xs text-muted-foreground max-w-[260px] leading-relaxed">Make sure no one is watching your screen and nothing is recording.</div>
+        <button id="v-reveal" class="v-btn-primary px-5">Reveal</button>
+        <button id="v-reveal-cancel" class="v-btn px-4 hidden">No, wait</button>
       </div>
     </div>`
 }
@@ -252,42 +244,28 @@ function wireReveal(card: HTMLElement): void {
     let n = 5
     btn.disabled = true
     btn.textContent = `Revealing in ${n}…`
-    cancelBtn.style.display = 'block'
+    cancelBtn.classList.remove('hidden')
     timer = setInterval(() => {
       n -= 1
-      if (n <= 0) {
-        if (timer) clearInterval(timer)
-        box.style.filter = 'none'
-        cover.style.display = 'none'
-      } else {
-        btn.textContent = `Revealing in ${n}…`
-      }
+      if (n <= 0) { if (timer) clearInterval(timer); box.classList.remove('blur-md'); cover.classList.add('hidden') }
+      else btn.textContent = `Revealing in ${n}…`
     }, 1000)
   }
   cancelBtn.onclick = () => {
     if (timer) clearInterval(timer)
     btn.disabled = false
     btn.textContent = 'Reveal'
-    cancelBtn.style.display = 'none'
+    cancelBtn.classList.add('hidden')
   }
 }
 
 /** Open the dimmed-backdrop overlay and return the (empty) card to fill + a close fn. */
 function openOverlay(): { card: HTMLDivElement; close: () => void } {
   showTxOverlay(true)
-  // Keep the card's children at their natural height (scroll the card instead of
-  // squishing inputs/buttons when the content is taller than the viewport).
-  if (!document.getElementById('v-card-style')) {
-    const st = document.createElement('style')
-    st.id = 'v-card-style'
-    st.textContent = '.v-card>*{flex-shrink:0}'
-    document.head.appendChild(st)
-  }
   const backdrop = document.createElement('div')
-  backdrop.style.cssText = BACKDROP_CSS
+  backdrop.className = 'v-backdrop'
   const card = document.createElement('div')
   card.className = 'v-card'
-  card.style.cssText = CARD_CSS
   backdrop.appendChild(card)
   document.body.appendChild(backdrop)
   return { card, close: () => { backdrop.remove(); showTxOverlay(false) } }
@@ -305,16 +283,15 @@ function promptPinAction<T>(
 ): Promise<T> {
   const { card, close } = openOverlay()
   card.innerHTML = `
-    ${FOCUS_STYLE}
-    <div style="${EYEBROW_CSS}">${esc(opts.eyebrow || 'DEN Vault')}</div>
-    <div style="${TITLE_CSS}">${esc(opts.title)}</div>
-    ${opts.subtitle ? `<div style="color:#a1a1aa;font-size:13px">${esc(opts.subtitle)}</div>` : ''}
+    <div class="v-eyebrow">${esc(opts.eyebrow || 'DEN Vault')}</div>
+    <div class="v-title">${esc(opts.title)}</div>
+    ${opts.subtitle ? `<div class="v-note">${esc(opts.subtitle)}</div>` : ''}
     ${opts.bodyHtml || ''}
-    <input id="v-pin" class="v-in" type="password" inputmode="numeric" placeholder="${esc(opts.placeholder || 'Enter PIN')}" style="${INPUT_CSS}" />
-    <div id="v-err" style="${ERR_CSS}"></div>
-    <div style="display:flex;gap:10px">
-      <button id="v-cancel" style="${BTN_CANCEL_CSS}">Cancel</button>
-      <button id="v-ok" style="${BTN_OK_CSS}">${esc(opts.confirmLabel || 'Confirm')}</button>
+    <input id="v-pin" class="v-input" type="password" inputmode="numeric" placeholder="${esc(opts.placeholder || 'Enter PIN')}" />
+    <div id="v-err" class="v-err"></div>
+    <div class="v-row">
+      <button id="v-cancel" class="v-btn v-grow">Cancel</button>
+      <button id="v-ok" class="v-btn-primary v-grow-lg">${esc(opts.confirmLabel || 'Confirm')}</button>
     </div>`
   const pinInput = card.querySelector('#v-pin') as HTMLInputElement
   const errEl = card.querySelector('#v-err') as HTMLDivElement
@@ -344,7 +321,7 @@ function promptPinAction<T>(
  * can't be forged by a compromised app.
  */
 function confirmAndSign(acct: AccountMeta, d: TxDisplay, sign: (privHex: string) => string): Promise<{ signed: string }> {
-  const rows = d.rows.map(([k, v]) => `<div style="display:flex;justify-content:space-between;gap:16px"><span style="color:#a1a1aa;flex-shrink:0">${esc(k)}</span><span style="font-weight:600;text-align:right;word-break:break-all">${esc(v)}</span></div>`).join('')
+  const rows = d.rows.map(([k, v]) => `<div class="flex justify-between gap-4"><span class="text-muted-foreground shrink-0">${esc(k)}</span><span class="font-semibold text-right break-all">${esc(v)}</span></div>`).join('')
   return promptPinAction(
     { title: d.title, eyebrow: 'DEN Vault · Secure confirm', bodyHtml: inset(rows), placeholder: 'Enter PIN to sign', confirmLabel: 'Confirm & Sign' },
     async (pin) => {
@@ -393,19 +370,18 @@ function showGenerateReveal(mnemonic: string): Promise<{ pubkey: string; seedId:
   const { card, close } = openOverlay()
   const words = mnemonic.split(' ')
   card.innerHTML = `
-    ${FOCUS_STYLE}
-    <div style="${EYEBROW_CSS}">DEN Vault · New seed</div>
-    <div style="${TITLE_CSS}">Back up your recovery phrase</div>
-    <div style="color:#a1a1aa;font-size:13px;line-height:1.5">Write these ${words.length} words down in order. They're the only way to recover your accounts — anyone who has them controls your funds.</div>
+    <div class="v-eyebrow">DEN Vault · New seed</div>
+    <div class="v-title">Back up your recovery phrase</div>
+    <div class="v-note">Write these ${words.length} words down in order. They're the only way to recover your accounts — anyone who has them controls your funds.</div>
     ${revealBlock(wordChips(words))}
-    <input id="v-name" class="v-in" type="text" placeholder="Seed label (optional)" style="${INPUT_CSS}" />
-    <input id="v-pin" class="v-in" type="password" inputmode="numeric" placeholder="Set a PIN to encrypt this seed" style="${INPUT_CSS}" />
-    <input id="v-hint" class="v-in" type="text" placeholder="PIN hint (optional)" style="${INPUT_CSS}" />
-    <button id="v-dl" style="${BTN_CANCEL_CSS};width:100%;flex:none">Download encrypted backup</button>
-    <div id="v-err" style="${ERR_CSS}"></div>
-    <div style="display:flex;gap:10px">
-      <button id="v-cancel" style="${BTN_CANCEL_CSS}">Cancel</button>
-      <button id="v-ok" style="${BTN_OK_CSS}">I've saved it — Continue</button>
+    <input id="v-name" class="v-input" type="text" placeholder="Seed label (optional)" />
+    <input id="v-pin" class="v-input" type="password" inputmode="numeric" placeholder="Set a PIN to encrypt this seed" />
+    <input id="v-hint" class="v-input" type="text" placeholder="PIN hint (optional)" />
+    <button id="v-dl" class="v-btn">Download encrypted backup</button>
+    <div id="v-err" class="v-err"></div>
+    <div class="v-row">
+      <button id="v-cancel" class="v-btn v-grow">Cancel</button>
+      <button id="v-ok" class="v-btn-primary v-grow-lg">I've saved it — Continue</button>
     </div>`
   wireReveal(card)
   const nameInput = card.querySelector('#v-name') as HTMLInputElement
@@ -465,19 +441,18 @@ function tryParseBackup(raw: string): BackupPayloadV1 | null {
 function showImportOverlay(): Promise<{ pubkey: string; seedId: string }> {
   const { card, close } = openOverlay()
   card.innerHTML = `
-    ${FOCUS_STYLE}
-    <div style="${EYEBROW_CSS}">DEN Vault · Import</div>
-    <div style="${TITLE_CSS}">Import an account</div>
-    <div style="color:#a1a1aa;font-size:13px">Paste a recovery phrase, an nsec, or the contents of a backup file — or choose a backup file.</div>
-    <textarea id="v-secret" class="v-in" placeholder="word1 word2 …   /   nsec1…   /   backup JSON" style="${INPUT_CSS};height:88px;padding:10px 14px;resize:none;font-family:inherit"></textarea>
-    <label style="${BTN_CANCEL_CSS};display:flex;align-items:center;justify-content:center;flex:none">Choose backup file<input id="v-file" type="file" accept="application/json,.json" style="display:none" /></label>
-    <input id="v-name" class="v-in" type="text" placeholder="Label (optional)" style="${INPUT_CSS}" />
-    <input id="v-pin" class="v-in" type="password" inputmode="numeric" placeholder="Backup password, or a new PIN" style="${INPUT_CSS}" />
-    <input id="v-hint" class="v-in" type="text" placeholder="PIN hint (optional)" style="${INPUT_CSS}" />
-    <div id="v-err" style="${ERR_CSS}"></div>
-    <div style="display:flex;gap:10px">
-      <button id="v-cancel" style="${BTN_CANCEL_CSS}">Cancel</button>
-      <button id="v-ok" style="${BTN_OK_CSS}">Import</button>
+    <div class="v-eyebrow">DEN Vault · Import</div>
+    <div class="v-title">Import an account</div>
+    <div class="v-note">Paste a recovery phrase, an nsec, or the contents of a backup file — or choose a backup file.</div>
+    <textarea id="v-secret" class="v-textarea" placeholder="word1 word2 …   /   nsec1…   /   backup JSON"></textarea>
+    <label class="v-btn">Choose backup file<input id="v-file" type="file" accept="application/json,.json" class="hidden" /></label>
+    <input id="v-name" class="v-input" type="text" placeholder="Label (optional)" />
+    <input id="v-pin" class="v-input" type="password" inputmode="numeric" placeholder="Backup password, or a new PIN" />
+    <input id="v-hint" class="v-input" type="text" placeholder="PIN hint (optional)" />
+    <div id="v-err" class="v-err"></div>
+    <div class="v-row">
+      <button id="v-cancel" class="v-btn v-grow">Cancel</button>
+      <button id="v-ok" class="v-btn-primary v-grow-lg">Import</button>
     </div>`
   const secretInput = card.querySelector('#v-secret') as HTMLTextAreaElement
   const fileInput = card.querySelector('#v-file') as HTMLInputElement
@@ -533,14 +508,14 @@ function showSecretReveal(secret: string, payload: BackupPayloadV1, label: strin
   const isMnemonic = secret.trim().includes(' ')
   const inner = isMnemonic
     ? wordChips(secret.trim().split(/\s+/))
-    : `<span style="word-break:break-all;font-weight:600;color:#fafafa">${esc(secret)}</span>`
+    : `<span class="break-all font-semibold text-foreground">${esc(secret)}</span>`
   card.innerHTML = `
-    <div style="${EYEBROW_CSS}">DEN Vault · Secret</div>
-    <div style="${TITLE_CSS}">${isMnemonic ? 'Recovery phrase' : 'Private key (nsec)'}</div>
-    <div style="color:#a1a1aa;font-size:13px;line-height:1.5">Keep this secret — anyone who has it controls this account.</div>
+    <div class="v-eyebrow">DEN Vault · Secret</div>
+    <div class="v-title">${isMnemonic ? 'Recovery phrase' : 'Private key (nsec)'}</div>
+    <div class="v-note">Keep this secret — anyone who has it controls this account.</div>
     ${revealBlock(inner)}
-    <button id="v-dl" style="${BTN_CANCEL_CSS};width:100%;flex:none">Download encrypted backup</button>
-    <button id="v-ok" style="${BTN_OK_CSS};width:100%;flex:none">Done</button>`
+    <button id="v-dl" class="v-btn">Download encrypted backup</button>
+    <button id="v-ok" class="v-btn-primary">Done</button>`
   wireReveal(card)
   ;(card.querySelector('#v-dl') as HTMLButtonElement).onclick = () => downloadBackup(payload, label)
   return new Promise<void>((resolve) => {
@@ -552,14 +527,13 @@ function showSecretReveal(secret: string, payload: BackupPayloadV1, label: strin
 function showChangePin(seedId: string): Promise<{ ok: boolean }> {
   const { card, close } = openOverlay()
   card.innerHTML = `
-    ${FOCUS_STYLE}
-    <div style="${EYEBROW_CSS}">DEN Vault · Change PIN</div>
-    <div style="${TITLE_CSS}">Change PIN</div>
-    <input id="v-cur" class="v-in" type="password" inputmode="numeric" placeholder="Current PIN" style="${INPUT_CSS}" />
-    <input id="v-new" class="v-in" type="password" inputmode="numeric" placeholder="New PIN" style="${INPUT_CSS}" />
-    <input id="v-hint" class="v-in" type="text" placeholder="New PIN hint (optional)" style="${INPUT_CSS}" />
-    <div id="v-err" style="${ERR_CSS}"></div>
-    <div style="display:flex;gap:10px"><button id="v-cancel" style="${BTN_CANCEL_CSS}">Cancel</button><button id="v-ok" style="${BTN_OK_CSS}">Change PIN</button></div>`
+    <div class="v-eyebrow">DEN Vault · Change PIN</div>
+    <div class="v-title">Change PIN</div>
+    <input id="v-cur" class="v-input" type="password" inputmode="numeric" placeholder="Current PIN" />
+    <input id="v-new" class="v-input" type="password" inputmode="numeric" placeholder="New PIN" />
+    <input id="v-hint" class="v-input" type="text" placeholder="New PIN hint (optional)" />
+    <div id="v-err" class="v-err"></div>
+    <div class="v-row"><button id="v-cancel" class="v-btn v-grow">Cancel</button><button id="v-ok" class="v-btn-primary v-grow-lg">Change PIN</button></div>`
   const cur = card.querySelector('#v-cur') as HTMLInputElement
   const nw = card.querySelector('#v-new') as HTMLInputElement
   const hintEl = card.querySelector('#v-hint') as HTMLInputElement
