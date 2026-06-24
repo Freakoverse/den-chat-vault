@@ -209,58 +209,324 @@ function decodeErc20(data: Uint8Array): { to: string; amount: bigint } | null {
 
 interface TxDisplay { title: string; rows: Array<[string, string]> }
 
-/**
- * Render the confirm UI from vault-computed display rows, collect the PIN, and on
- * "Confirm" verify it (re-derive the key) + sign. Rejects on cancel. The displayed
- * details are derived by the vault from the structured tx, so they can't be forged.
- */
-function confirmAndSign(acct: AccountMeta, d: TxDisplay, sign: (privHex: string) => string): Promise<{ signed: string }> {
+/* ─── Shared overlay styling (matches the app's dark theme tokens) ─── */
+const BACKDROP_CSS = 'position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:16px;background:rgba(0,0,0,0.6);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);color:#fafafa;font:14px/1.5 system-ui,-apple-system,sans-serif;z-index:2147483647;box-sizing:border-box'
+const CARD_CSS = 'width:100%;max-width:400px;max-height:92vh;overflow-y:auto;display:flex;flex-direction:column;gap:14px;background:#171717;border:1px solid #27272a;border-radius:16px;padding:20px;box-shadow:0 24px 70px rgba(0,0,0,0.6);box-sizing:border-box'
+const EYEBROW_CSS = 'color:#a1a1aa;font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase'
+const TITLE_CSS = 'font-size:18px;font-weight:700;color:#fafafa'
+const INPUT_CSS = 'width:100%;height:48px;border-radius:12px;border:1px solid #3f3f46;background:#1d1d20;color:#fafafa;padding:0 14px;font-size:16px;outline:none;box-sizing:border-box'
+const ERR_CSS = 'color:#f87171;font-size:12px;min-height:16px'
+const BTN_CANCEL_CSS = 'flex:1;height:48px;border-radius:12px;border:1px solid #2a2a2e;background:#1d1d20;color:#fafafa;cursor:pointer;font-size:14px'
+const BTN_OK_CSS = 'flex:1.4;height:48px;border-radius:12px;border:0;background:#4a6df7;color:#fafafa;font-weight:600;cursor:pointer;font-size:14px'
+const FOCUS_STYLE = '<style>.v-in:focus{border-color:#4a6df7}.v-in::placeholder{color:#71717a}</style>'
+const inset = (html: string) => `<div style="display:flex;flex-direction:column;gap:10px;background:#1d1d20;border:1px solid #2a2a2e;border-radius:12px;padding:14px">${html}</div>`
+
+/** Open the dimmed-backdrop overlay and return the (empty) card to fill + a close fn. */
+function openOverlay(): { card: HTMLDivElement; close: () => void } {
   showTxOverlay(true)
-  const el = document.createElement('div')
-  // Dimmed, blurred backdrop — the app shows through behind it, so this reads as an
-  // in-app modal rather than a separate page (the card below is the only opaque part).
-  el.style.cssText = 'position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:16px;background:rgba(6,8,12,0.62);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);color:#e6e8eb;font:14px/1.5 system-ui,-apple-system,sans-serif;z-index:2147483647;box-sizing:border-box'
-  const rows = d.rows.map(([k, v]) => `<div style="display:flex;justify-content:space-between;gap:16px"><span style="color:#8b93a1;flex-shrink:0">${esc(k)}</span><span style="font-weight:600;text-align:right;word-break:break-all">${esc(v)}</span></div>`).join('')
-  el.innerHTML = `
-    <div style="width:100%;max-width:400px;display:flex;flex-direction:column;gap:14px;background:#0f1420;border:1px solid #232b3a;border-radius:18px;padding:20px;box-shadow:0 24px 70px rgba(0,0,0,0.55);box-sizing:border-box">
-      <div style="display:flex;align-items:center;gap:7px;color:#8b93a1;font-size:11px;font-weight:600;letter-spacing:.05em;text-transform:uppercase"><span style="font-size:13px">🔒</span> DEN Vault · Secure confirm</div>
-      <div style="font-size:18px;font-weight:700">${esc(d.title)}</div>
-      <div style="display:flex;flex-direction:column;gap:10px;background:#141925;border:1px solid #232b3a;border-radius:12px;padding:14px">${rows}</div>
-      <input id="v-pin" type="password" inputmode="numeric" placeholder="Enter PIN to sign" style="width:100%;height:46px;border-radius:12px;border:1px solid #232b3a;background:#0b0e14;color:#e6e8eb;padding:0 14px;font-size:16px;box-sizing:border-box" />
-      <div id="v-err" style="color:#f87171;font-size:12px;min-height:16px"></div>
-      <div style="display:flex;gap:10px">
-        <button id="v-cancel" style="flex:1;height:46px;border-radius:12px;border:1px solid #232b3a;background:#141925;color:#e6e8eb;cursor:pointer;font-size:14px">Cancel</button>
-        <button id="v-ok" style="flex:1.4;height:46px;border-radius:12px;border:0;background:#3b82f6;color:#fff;font-weight:600;cursor:pointer;font-size:14px">Confirm &amp; Sign</button>
-      </div>
+  const backdrop = document.createElement('div')
+  backdrop.style.cssText = BACKDROP_CSS
+  const card = document.createElement('div')
+  card.style.cssText = CARD_CSS
+  backdrop.appendChild(card)
+  document.body.appendChild(backdrop)
+  return { card, close: () => { backdrop.remove(); showTxOverlay(false) } }
+}
+
+/**
+ * The core in-vault PIN gate: render a card (optional body above the PIN field),
+ * collect the PIN, run `action(pin)`. On error (wrong PIN / rate-limit / etc.) the
+ * message shows and the field clears for a retry; on success it resolves. Rejects
+ * with "Cancelled" on Cancel. The PIN never leaves the vault origin.
+ */
+function promptPinAction<T>(
+  opts: { title: string; eyebrow?: string; subtitle?: string; bodyHtml?: string; placeholder?: string; confirmLabel?: string },
+  action: (pin: string) => Promise<T>,
+): Promise<T> {
+  const { card, close } = openOverlay()
+  card.innerHTML = `
+    ${FOCUS_STYLE}
+    <div style="${EYEBROW_CSS}">${esc(opts.eyebrow || 'DEN Vault')}</div>
+    <div style="${TITLE_CSS}">${esc(opts.title)}</div>
+    ${opts.subtitle ? `<div style="color:#a1a1aa;font-size:13px">${esc(opts.subtitle)}</div>` : ''}
+    ${opts.bodyHtml || ''}
+    <input id="v-pin" class="v-in" type="password" inputmode="numeric" placeholder="${esc(opts.placeholder || 'Enter PIN')}" style="${INPUT_CSS}" />
+    <div id="v-err" style="${ERR_CSS}"></div>
+    <div style="display:flex;gap:10px">
+      <button id="v-cancel" style="${BTN_CANCEL_CSS}">Cancel</button>
+      <button id="v-ok" style="${BTN_OK_CSS}">${esc(opts.confirmLabel || 'Confirm')}</button>
     </div>`
-  document.body.appendChild(el)
-  const pinInput = el.querySelector('#v-pin') as HTMLInputElement
-  const errEl = el.querySelector('#v-err') as HTMLDivElement
-  const okBtn = el.querySelector('#v-ok') as HTMLButtonElement
+  const pinInput = card.querySelector('#v-pin') as HTMLInputElement
+  const errEl = card.querySelector('#v-err') as HTMLDivElement
+  const okBtn = card.querySelector('#v-ok') as HTMLButtonElement
   pinInput.focus()
-  return new Promise<{ signed: string }>((resolve, reject) => {
-    const close = () => { el.remove(); showTxOverlay(false) }
+  return new Promise<T>((resolve, reject) => {
     okBtn.onclick = async () => {
       const pin = pinInput.value
       if (!pin) { errEl.textContent = 'Enter your PIN'; return }
       okBtn.disabled = true
       try {
-        await rateGuard(acct.seedId)
-        const blob = await getSeedBlob(acct.seedId)
-        if (!blob) throw new Error('No account')
-        let secret: string
-        try { secret = await decryptBackup(blob, pin) }
-        catch { await rateFail(acct.seedId); errEl.textContent = 'Incorrect PIN'; pinInput.value = ''; pinInput.focus(); okBtn.disabled = false; return }
-        await rateReset(acct.seedId)
-        const { privHex } = keypairFromSecret(secret, acct.index)
-        const signed = sign(privHex)
-        close(); resolve({ signed })
+        const result = await action(pin)
+        close(); resolve(result)
       } catch (e) {
-        errEl.textContent = e instanceof Error ? e.message : 'Signing failed'; okBtn.disabled = false
+        errEl.textContent = e instanceof Error ? e.message : 'Failed'
+        pinInput.value = ''; pinInput.focus(); okBtn.disabled = false
       }
     }
-    ;(el.querySelector('#v-cancel') as HTMLButtonElement).onclick = () => { close(); reject(new Error('Transaction cancelled')) }
+    ;(card.querySelector('#v-cancel') as HTMLButtonElement).onclick = () => { close(); reject(new Error('Cancelled')) }
     pinInput.onkeydown = (e) => { if (e.key === 'Enter') okBtn.click() }
+  })
+}
+
+/**
+ * Show the tx-confirm card from vault-computed display rows, then PIN-gate the sign.
+ * The displayed details are derived by the vault from the structured tx, so they
+ * can't be forged by a compromised app.
+ */
+function confirmAndSign(acct: AccountMeta, d: TxDisplay, sign: (privHex: string) => string): Promise<{ signed: string }> {
+  const rows = d.rows.map(([k, v]) => `<div style="display:flex;justify-content:space-between;gap:16px"><span style="color:#a1a1aa;flex-shrink:0">${esc(k)}</span><span style="font-weight:600;text-align:right;word-break:break-all">${esc(v)}</span></div>`).join('')
+  return promptPinAction(
+    { title: d.title, eyebrow: 'DEN Vault · Secure confirm', bodyHtml: inset(rows), placeholder: 'Enter PIN to sign', confirmLabel: 'Confirm & Sign' },
+    async (pin) => {
+      await rateGuard(acct.seedId)
+      const blob = await getSeedBlob(acct.seedId)
+      if (!blob) throw new Error('No account')
+      let secret: string
+      try { secret = await decryptBackup(blob, pin) }
+      catch { await rateFail(acct.seedId); throw new Error('Incorrect PIN') }
+      await rateReset(acct.seedId)
+      return { signed: sign(keypairFromSecret(secret, acct.index).privHex) }
+    },
+  )
+}
+
+/* ─── Generate + backup reveal (rendered entirely in the vault overlay) ─── */
+
+/** Encrypt + store a generated mnemonic as a new seed + its index-0 account, then unlock. */
+async function persistGeneratedSeed(mnemonic: string, pin: string, name?: string, hint?: string): Promise<{ pubkey: string; seedId: string }> {
+  if (!validateMnemonic(mnemonic, wordlist)) throw new Error('Invalid mnemonic')
+  const { privHex, pubHex } = deriveKeypair(mnemonic, 0)
+  const seedId = pubHex
+  await kvSet(seedBlobKey(seedId), await encryptBackup(mnemonic, pin))
+  await upsertSeed({ id: seedId, name: name || 'My Seed', kind: 'seed', hint: hint || null, createdAt: now() })
+  await upsertAccount({ pubkey: pubHex, npub: nip19.npubEncode(pubHex), seedId, index: 0, name: null, createdAt: now() })
+  await rateReset(seedId)
+  unlockSession(privHex)
+  return { pubkey: pubHex, seedId }
+}
+
+/** Download an encrypted backup payload as a file (ciphertext only — never plaintext). */
+function downloadBackup(payload: BackupPayloadV1, label: string) {
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `den-backup-${label}.json`
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  setTimeout(() => URL.revokeObjectURL(url), 1500)
+}
+
+/** Reveal the generated mnemonic + collect a label/PIN/hint — all in the overlay; persist on continue. */
+function showGenerateReveal(mnemonic: string): Promise<{ pubkey: string; seedId: string }> {
+  const { card, close } = openOverlay()
+  const words = mnemonic.split(' ')
+  const wordsHtml = words.map((w, i) => `<span style="display:inline-flex;gap:6px;align-items:baseline;background:#171717;border:1px solid #2a2a2e;border-radius:8px;padding:5px 9px;font-size:13px"><span style="color:#71717a;font-size:11px">${i + 1}</span><span style="font-weight:600;color:#fafafa">${esc(w)}</span></span>`).join('')
+  card.innerHTML = `
+    ${FOCUS_STYLE}
+    <div style="${EYEBROW_CSS}">DEN Vault · New seed</div>
+    <div style="${TITLE_CSS}">Back up your recovery phrase</div>
+    <div style="color:#a1a1aa;font-size:13px">Write these ${words.length} words down in order. They're the only way to recover your accounts — anyone who has them controls your funds.</div>
+    <div style="display:flex;flex-wrap:wrap;gap:8px;background:#1d1d20;border:1px solid #2a2a2e;border-radius:12px;padding:14px;max-height:34vh;overflow:auto">${wordsHtml}</div>
+    <input id="v-name" class="v-in" type="text" placeholder="Seed label (optional)" style="${INPUT_CSS}" />
+    <input id="v-pin" class="v-in" type="password" inputmode="numeric" placeholder="Set a PIN to encrypt this seed" style="${INPUT_CSS}" />
+    <input id="v-hint" class="v-in" type="text" placeholder="PIN hint (optional)" style="${INPUT_CSS}" />
+    <button id="v-dl" style="${BTN_CANCEL_CSS};width:100%">Download encrypted backup</button>
+    <div id="v-err" style="${ERR_CSS}"></div>
+    <div style="display:flex;gap:10px">
+      <button id="v-cancel" style="${BTN_CANCEL_CSS}">Cancel</button>
+      <button id="v-ok" style="${BTN_OK_CSS}">I've saved it — Continue</button>
+    </div>`
+  const nameInput = card.querySelector('#v-name') as HTMLInputElement
+  const pinInput = card.querySelector('#v-pin') as HTMLInputElement
+  const hintInput = card.querySelector('#v-hint') as HTMLInputElement
+  const errEl = card.querySelector('#v-err') as HTMLDivElement
+  const okBtn = card.querySelector('#v-ok') as HTMLButtonElement
+  const dlBtn = card.querySelector('#v-dl') as HTMLButtonElement
+  pinInput.focus()
+  return new Promise((resolve, reject) => {
+    dlBtn.onclick = async () => {
+      const pin = pinInput.value
+      if (pin.length < 4) { errEl.textContent = 'Set a PIN (4+ characters) before downloading'; return }
+      try { downloadBackup(await encryptBackup(mnemonic, pin), deriveKeypair(mnemonic).pubHex.slice(0, 8)) }
+      catch { errEl.textContent = 'Could not create the backup file' }
+    }
+    okBtn.onclick = async () => {
+      const pin = pinInput.value
+      if (pin.length < 4) { errEl.textContent = 'Set a PIN of at least 4 characters'; return }
+      okBtn.disabled = true
+      try {
+        const r = await persistGeneratedSeed(mnemonic, pin, nameInput.value.trim() || undefined, hintInput.value.trim() || undefined)
+        close(); resolve(r)
+      } catch (e) {
+        errEl.textContent = e instanceof Error ? e.message : 'Could not save'; okBtn.disabled = false
+      }
+    }
+    ;(card.querySelector('#v-cancel') as HTMLButtonElement).onclick = () => { close(); reject(new Error('Cancelled')) }
+  })
+}
+
+/* ─── Import (raw secret OR encrypted backup), rendered in the vault overlay ─── */
+
+/** Store an already-known secret + its at-rest blob as a new seed/key, then unlock. */
+async function persistSecretBlob(secret: string, payload: BackupPayloadV1, name?: string, hint?: string): Promise<{ pubkey: string; seedId: string }> {
+  const isSeed = validateMnemonic(secret.trim(), wordlist)
+  const { privHex, pubHex } = keypairFromSecret(secret, 0)
+  const seedId = pubHex
+  await kvSet(seedBlobKey(seedId), payload)
+  await upsertSeed({ id: seedId, name: isSeed ? (name || 'My Seed') : (name || null), kind: isSeed ? 'seed' : 'key', hint: hint || null, createdAt: now() })
+  await upsertAccount({ pubkey: pubHex, npub: nip19.npubEncode(pubHex), seedId, index: 0, name: isSeed ? null : (name || null), createdAt: now() })
+  await rateReset(seedId)
+  unlockSession(privHex)
+  return { pubkey: pubHex, seedId }
+}
+
+/** A pasted string is an encrypted backup if it parses as our v1 payload JSON. */
+function tryParseBackup(raw: string): BackupPayloadV1 | null {
+  try {
+    const o = JSON.parse(raw)
+    if (o && o.version === 1 && typeof o.ciphertext === 'string' && typeof o.salt === 'string' && typeof o.iv === 'string') return o as BackupPayloadV1
+  } catch { /* not JSON → treat as a raw secret */ }
+  return null
+}
+
+/** Collect the secret (paste or file) + PIN entirely in the overlay; the secret never reaches the app. */
+function showImportOverlay(): Promise<{ pubkey: string; seedId: string }> {
+  const { card, close } = openOverlay()
+  card.innerHTML = `
+    ${FOCUS_STYLE}
+    <div style="${EYEBROW_CSS}">DEN Vault · Import</div>
+    <div style="${TITLE_CSS}">Import an account</div>
+    <div style="color:#a1a1aa;font-size:13px">Paste a recovery phrase, an nsec, or the contents of a backup file — or choose a backup file.</div>
+    <textarea id="v-secret" class="v-in" placeholder="word1 word2 …   /   nsec1…   /   backup JSON" style="${INPUT_CSS};height:88px;padding:10px 14px;resize:none;font-family:inherit"></textarea>
+    <label style="${BTN_CANCEL_CSS};display:flex;align-items:center;justify-content:center">Choose backup file<input id="v-file" type="file" accept="application/json,.json" style="display:none" /></label>
+    <input id="v-name" class="v-in" type="text" placeholder="Label (optional)" style="${INPUT_CSS}" />
+    <input id="v-pin" class="v-in" type="password" inputmode="numeric" placeholder="Backup password, or a new PIN" style="${INPUT_CSS}" />
+    <input id="v-hint" class="v-in" type="text" placeholder="PIN hint (optional)" style="${INPUT_CSS}" />
+    <div id="v-err" style="${ERR_CSS}"></div>
+    <div style="display:flex;gap:10px">
+      <button id="v-cancel" style="${BTN_CANCEL_CSS}">Cancel</button>
+      <button id="v-ok" style="${BTN_OK_CSS}">Import</button>
+    </div>`
+  const secretInput = card.querySelector('#v-secret') as HTMLTextAreaElement
+  const fileInput = card.querySelector('#v-file') as HTMLInputElement
+  const nameInput = card.querySelector('#v-name') as HTMLInputElement
+  const pinInput = card.querySelector('#v-pin') as HTMLInputElement
+  const hintInput = card.querySelector('#v-hint') as HTMLInputElement
+  const errEl = card.querySelector('#v-err') as HTMLDivElement
+  const okBtn = card.querySelector('#v-ok') as HTMLButtonElement
+  secretInput.focus()
+  return new Promise((resolve, reject) => {
+    fileInput.onchange = async () => {
+      const f = fileInput.files?.[0]
+      if (!f) return
+      try { secretInput.value = await f.text() } catch { errEl.textContent = 'Could not read that file' }
+    }
+    okBtn.onclick = async () => {
+      const raw = secretInput.value.trim()
+      const pin = pinInput.value
+      const name = nameInput.value.trim() || undefined
+      const hint = hintInput.value.trim() || undefined
+      if (!raw) { errEl.textContent = 'Paste your phrase, nsec, or backup'; return }
+      if (pin.length < 4) { errEl.textContent = 'Enter the backup password or a new PIN'; return }
+      okBtn.disabled = true
+      try {
+        const payload = tryParseBackup(raw)
+        let r: { pubkey: string; seedId: string }
+        if (payload) {
+          // Encrypted backup: the PIN is its password; the payload becomes the at-rest blob.
+          let secret: string
+          try { secret = await decryptBackup(payload, pin) }
+          catch { throw new Error('Wrong password for this backup file') }
+          r = await persistSecretBlob(secret, payload, name, hint)
+        } else {
+          // Raw secret: validate, then encrypt with the new PIN.
+          if (raw.includes(' ')) { if (!validateMnemonic(raw, wordlist)) throw new Error('Invalid recovery phrase') }
+          else { try { keypairFromSecret(raw, 0) } catch { throw new Error('Not a valid nsec / key') } }
+          r = await persistSecretBlob(raw, await encryptBackup(raw, pin), name, hint)
+        }
+        close(); resolve(r)
+      } catch (e) {
+        errEl.textContent = e instanceof Error ? e.message : 'Import failed'; okBtn.disabled = false
+      }
+    }
+    ;(card.querySelector('#v-cancel') as HTMLButtonElement).onclick = () => { close(); reject(new Error('Cancelled')) }
+  })
+}
+
+/* ─── Reveal + change-PIN overlays (Phase 4) ─── */
+
+/** Show a decrypted secret (recovery phrase or nsec) + a backup download, in the overlay. */
+function showSecretReveal(secret: string, payload: BackupPayloadV1, label: string): Promise<void> {
+  const { card, close } = openOverlay()
+  const isMnemonic = secret.trim().includes(' ')
+  const body = isMnemonic
+    ? `<div style="display:flex;flex-wrap:wrap;gap:8px;background:#1d1d20;border:1px solid #2a2a2e;border-radius:12px;padding:14px;max-height:34vh;overflow:auto">${secret.trim().split(/\s+/).map((w, i) => `<span style="display:inline-flex;gap:6px;align-items:baseline;background:#171717;border:1px solid #2a2a2e;border-radius:8px;padding:5px 9px;font-size:13px"><span style="color:#71717a;font-size:11px">${i + 1}</span><span style="font-weight:600;color:#fafafa">${esc(w)}</span></span>`).join('')}</div>`
+    : inset(`<span style="word-break:break-all;font-weight:600;color:#fafafa">${esc(secret)}</span>`)
+  card.innerHTML = `
+    <div style="${EYEBROW_CSS}">DEN Vault · Secret</div>
+    <div style="${TITLE_CSS}">${isMnemonic ? 'Recovery phrase' : 'Private key (nsec)'}</div>
+    <div style="color:#a1a1aa;font-size:13px">Keep this secret — anyone who has it controls this account.</div>
+    ${body}
+    <button id="v-dl" style="${BTN_CANCEL_CSS};width:100%">Download encrypted backup</button>
+    <button id="v-ok" style="${BTN_OK_CSS};width:100%">Done</button>`
+  ;(card.querySelector('#v-dl') as HTMLButtonElement).onclick = () => downloadBackup(payload, label)
+  return new Promise<void>((resolve) => {
+    ;(card.querySelector('#v-ok') as HTMLButtonElement).onclick = () => { close(); resolve() }
+  })
+}
+
+/** Change a seed's PIN — collects current + new PIN (+ hint) in the overlay, re-encrypts. */
+function showChangePin(seedId: string): Promise<{ ok: boolean }> {
+  const { card, close } = openOverlay()
+  card.innerHTML = `
+    ${FOCUS_STYLE}
+    <div style="${EYEBROW_CSS}">DEN Vault · Change PIN</div>
+    <div style="${TITLE_CSS}">Change PIN</div>
+    <input id="v-cur" class="v-in" type="password" inputmode="numeric" placeholder="Current PIN" style="${INPUT_CSS}" />
+    <input id="v-new" class="v-in" type="password" inputmode="numeric" placeholder="New PIN" style="${INPUT_CSS}" />
+    <input id="v-hint" class="v-in" type="text" placeholder="New PIN hint (optional)" style="${INPUT_CSS}" />
+    <div id="v-err" style="${ERR_CSS}"></div>
+    <div style="display:flex;gap:10px"><button id="v-cancel" style="${BTN_CANCEL_CSS}">Cancel</button><button id="v-ok" style="${BTN_OK_CSS}">Change PIN</button></div>`
+  const cur = card.querySelector('#v-cur') as HTMLInputElement
+  const nw = card.querySelector('#v-new') as HTMLInputElement
+  const hintEl = card.querySelector('#v-hint') as HTMLInputElement
+  const errEl = card.querySelector('#v-err') as HTMLDivElement
+  const okBtn = card.querySelector('#v-ok') as HTMLButtonElement
+  cur.focus()
+  return new Promise((resolve, reject) => {
+    okBtn.onclick = async () => {
+      if (nw.value.length < 4) { errEl.textContent = 'New PIN must be at least 4 characters'; return }
+      okBtn.disabled = true
+      try {
+        await rateGuard(seedId)
+        const blob = await getSeedBlob(seedId)
+        if (!blob) throw new Error('No such account')
+        let secret: string
+        try { secret = await decryptBackup(blob, cur.value) }
+        catch { await rateFail(seedId); throw new Error('Incorrect current PIN') }
+        await rateReset(seedId)
+        await kvSet(seedBlobKey(seedId), await encryptBackup(secret, nw.value))
+        const seeds = await getSeeds()
+        const s = seeds.find((x) => x.id === seedId)
+        if (s) { s.hint = hintEl.value.trim() || null; await setSeeds(seeds) }
+        close(); resolve({ ok: true })
+      } catch (e) {
+        errEl.textContent = e instanceof Error ? e.message : 'Failed'; okBtn.disabled = false
+      }
+    }
+    ;(card.querySelector('#v-cancel') as HTMLButtonElement).onclick = () => { close(); reject(new Error('Cancelled')) }
   })
 }
 
@@ -276,17 +542,14 @@ const ops: Record<string, (p?: any) => Promise<unknown>> = {
     const mnemonic = generateMnemonic(wordlist, 256)
     return { mnemonic, pubkey: deriveKeypair(mnemonic).pubHex }
   },
+  // Generate + reveal the mnemonic and collect the PIN/label entirely in the vault overlay —
+  // the plaintext seed and the PIN never reach the app. Returns only the new pubkey/seedId.
+  async generateInteractive() {
+    return showGenerateReveal(generateMnemonic(wordlist, 256))
+  },
   // Persist a generated mnemonic as a new seed + its first account (index 0), encrypted with `pin`.
   async saveNew({ mnemonic, pin, name, hint }: { mnemonic: string; pin: string; name?: string; hint?: string }) {
-    if (!validateMnemonic(mnemonic, wordlist)) throw new Error('Invalid mnemonic')
-    const { privHex, pubHex } = deriveKeypair(mnemonic, 0)
-    const seedId = pubHex
-    await kvSet(seedBlobKey(seedId), await encryptBackup(mnemonic, pin))
-    await upsertSeed({ id: seedId, name: name || 'My Seed', kind: 'seed', hint: hint || null, createdAt: now() })
-    await upsertAccount({ pubkey: pubHex, npub: nip19.npubEncode(pubHex), seedId, index: 0, name: null, createdAt: now() })
-    await rateReset(seedId)
-    unlockSession(privHex)
-    return { pubkey: pubHex, seedId }
+    return persistGeneratedSeed(mnemonic, pin, name, hint)
   },
   // Import an encrypted backup (mnemonic OR nsec/hex key) as a new seed; its password
   // becomes the seed PIN. The imported payload IS the at-rest blob (no re-encryption).
@@ -295,16 +558,12 @@ const ops: Record<string, (p?: any) => Promise<unknown>> = {
     // WebCrypto throws a message-less DOMException on a bad password; surface a clear error.
     try { secret = await decryptBackup(payload, password) }
     catch { throw new Error('Wrong password — could not decrypt this backup') }
-    const isSeed = validateMnemonic(secret.trim(), wordlist)
-    const { privHex, pubHex } = keypairFromSecret(secret, 0)
-    const seedId = pubHex
-    await kvSet(seedBlobKey(seedId), payload)
-    // A seed gets a label (default "My Seed"); a single key labels its standalone account.
-    await upsertSeed({ id: seedId, name: isSeed ? (name || 'My Seed') : (name || null), kind: isSeed ? 'seed' : 'key', hint: hint || null, createdAt: now() })
-    await upsertAccount({ pubkey: pubHex, npub: nip19.npubEncode(pubHex), seedId, index: 0, name: isSeed ? null : (name || null), createdAt: now() })
-    await rateReset(seedId)
-    unlockSession(privHex)
-    return { pubkey: pubHex, seedId }
+    return persistSecretBlob(secret, payload, name, hint)
+  },
+  // Import a recovery phrase / nsec / backup file entirely in the vault overlay — the
+  // secret and PIN never reach the app. Returns only the new pubkey/seedId.
+  async importInteractive() {
+    return showImportOverlay()
   },
   // Derive the next account from an existing seed (same PIN). Not allowed for single-key seeds.
   async deriveAccount({ seedId, pin, name }: { seedId: string; pin: string; name?: string }) {
@@ -324,6 +583,28 @@ const ops: Record<string, (p?: any) => Promise<unknown>> = {
     await upsertAccount({ pubkey: pubHex, npub: nip19.npubEncode(pubHex), seedId, index, name: name || null, createdAt: now() })
     return { pubkey: pubHex }
   },
+  // Derive the next account from a seed — PIN entered in the vault overlay.
+  async deriveInteractive({ seedId }: { seedId: string }) {
+    const blob = await getSeedBlob(seedId)
+    if (!blob) throw new Error('No such seed')
+    const seed = (await getSeeds()).find((s) => s.id === seedId)
+    return promptPinAction(
+      { title: 'Add an account', eyebrow: 'DEN Vault · Derive', subtitle: seed?.hint ? `Hint: ${seed.hint}` : "Enter this seed's PIN to derive the next account.", confirmLabel: 'Add account' },
+      async (pin) => {
+        await rateGuard(seedId)
+        let mnemonic: string
+        try { mnemonic = await decryptBackup(blob, pin) }
+        catch { await rateFail(seedId); throw new Error('Incorrect PIN') }
+        if (!validateMnemonic(mnemonic.trim(), wordlist)) throw new Error('This identity is a single key and cannot derive more accounts')
+        await rateReset(seedId)
+        const used = (await getAccounts()).filter((a) => a.seedId === seedId).map((a) => a.index)
+        const index = (used.length ? Math.max(...used) : -1) + 1
+        const { pubHex } = deriveKeypair(mnemonic, index)
+        await upsertAccount({ pubkey: pubHex, npub: nip19.npubEncode(pubHex), seedId, index, name: null, createdAt: now() })
+        return { pubkey: pubHex }
+      },
+    )
+  },
   async unlock({ pubkey, pin }: { pubkey: string; pin: string }) {
     const acct = (await getAccounts()).find((a) => a.pubkey === pubkey)
     if (!acct) throw new Error('No such account')
@@ -336,6 +617,27 @@ const ops: Record<string, (p?: any) => Promise<unknown>> = {
     await rateReset(acct.seedId)
     unlockSession(keypairFromSecret(secret, acct.index).privHex)
     return { pubkey: activePub }
+  },
+  // Like unlock(), but the PIN is collected in the vault's own overlay — the app never
+  // sees it. The app calls this and waits; the vault prompts, verifies, and unlocks.
+  async unlockInteractive({ pubkey }: { pubkey: string }) {
+    const acct = (await getAccounts()).find((a) => a.pubkey === pubkey)
+    if (!acct) throw new Error('No such account')
+    const seed = (await getSeeds()).find((s) => s.id === acct.seedId)
+    return promptPinAction(
+      { title: 'Unlock account', eyebrow: 'DEN Vault · Unlock', subtitle: seed?.hint ? `Hint: ${seed.hint}` : undefined, confirmLabel: 'Unlock' },
+      async (pin) => {
+        await rateGuard(acct.seedId)
+        const blob = await getSeedBlob(acct.seedId)
+        if (!blob) throw new Error('No such account')
+        let secret: string
+        try { secret = await decryptBackup(blob, pin) }
+        catch { await rateFail(acct.seedId); throw new Error('Incorrect PIN') }
+        await rateReset(acct.seedId)
+        unlockSession(keypairFromSecret(secret, acct.index).privHex)
+        return { pubkey: activePub }
+      },
+    )
   },
   async lock() { lock(); return { ok: true } },
   async removeAccount({ pubkey, pin }: { pubkey: string; pin: string }) {
@@ -355,6 +657,28 @@ const ops: Record<string, (p?: any) => Promise<unknown>> = {
     if (activePub === pubkey) lock()
     return { ok: true }
   },
+  // Remove an account — PIN confirmed in the vault overlay.
+  async removeInteractive({ pubkey }: { pubkey: string }) {
+    const accounts = await getAccounts()
+    const acct = accounts.find((a) => a.pubkey === pubkey)
+    if (!acct) return { ok: true }
+    return promptPinAction(
+      { title: 'Remove account', eyebrow: 'DEN Vault · Remove', subtitle: 'Enter your PIN to confirm. Make sure you have a backup — this deletes the key from this device.', confirmLabel: 'Remove' },
+      async (pin) => {
+        const blob = await getSeedBlob(acct.seedId)
+        if (blob) { try { await decryptBackup(blob, pin) } catch { await rateFail(acct.seedId); throw new Error('Incorrect PIN') } }
+        const remaining = accounts.filter((a) => a.pubkey !== pubkey)
+        await setAccounts(remaining)
+        if (!remaining.some((a) => a.seedId === acct.seedId)) {
+          await kvSet(seedBlobKey(acct.seedId), undefined)
+          await setSeeds((await getSeeds()).filter((s) => s.id !== acct.seedId))
+          await rateReset(acct.seedId)
+        }
+        if (activePub === pubkey) lock()
+        return { ok: true }
+      },
+    )
+  },
   // Return the account's seed blob as a backup payload (PIN-gated).
   async exportBackup({ pubkey, pin }: { pubkey: string; pin: string }) {
     const acct = (await getAccounts()).find((a) => a.pubkey === pubkey)
@@ -365,6 +689,28 @@ const ops: Record<string, (p?: any) => Promise<unknown>> = {
     try { await decryptBackup(blob, pin) } catch { await rateFail(acct.seedId); throw new Error('Incorrect PIN') }
     await rateReset(acct.seedId)
     return { payload: blob }
+  },
+  // Reveal the account's secret (phrase/nsec) + offer a backup download, all in the overlay.
+  // The plaintext is shown in the vault and never returned to the app.
+  async exportRevealInteractive({ pubkey }: { pubkey: string }) {
+    const acct = (await getAccounts()).find((a) => a.pubkey === pubkey)
+    if (!acct) throw new Error('No such account')
+    const blob = await getSeedBlob(acct.seedId)
+    if (!blob) throw new Error('No such account')
+    const seed = (await getSeeds()).find((s) => s.id === acct.seedId)
+    const secret = await promptPinAction(
+      { title: 'Reveal secret', eyebrow: 'DEN Vault · Reveal', subtitle: seed?.hint ? `Hint: ${seed.hint}` : "Enter your PIN to reveal this account's secret.", confirmLabel: 'Reveal' },
+      async (pin) => {
+        await rateGuard(acct.seedId)
+        let s: string
+        try { s = await decryptBackup(blob, pin) }
+        catch { await rateFail(acct.seedId); throw new Error('Incorrect PIN') }
+        await rateReset(acct.seedId)
+        return s
+      },
+    )
+    await showSecretReveal(secret, blob, pubkey.slice(0, 8))
+    return { ok: true }
   },
   async renameSeed({ seedId, name }: { seedId: string; name: string }) {
     const seeds = await getSeeds()
@@ -396,6 +742,12 @@ const ops: Record<string, (p?: any) => Promise<unknown>> = {
       if (s) { s.hint = newHint || null; await setSeeds(seeds) }
     }
     return { ok: true }
+  },
+  // Change a seed's PIN — current + new PIN entered in the vault overlay.
+  async changePinInteractive({ pubkey }: { pubkey: string }) {
+    const acct = (await getAccounts()).find((a) => a.pubkey === pubkey)
+    if (!acct) throw new Error('No such account')
+    return showChangePin(acct.seedId)
   },
   async getPublicKey() { if (!activePub) throw new Error('Locked'); return activePub },
   async signEvent({ event }: { event: EventTemplate }) {
