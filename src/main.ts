@@ -401,7 +401,7 @@ function showGenerateReveal(mnemonic: string): Promise<{ pubkey: string; seedId:
     <input id="v-name" class="v-in" type="text" placeholder="Seed label (optional)" style="${INPUT_CSS}" />
     <input id="v-pin" class="v-in" type="password" inputmode="numeric" placeholder="Set a PIN to encrypt this seed" style="${INPUT_CSS}" />
     <input id="v-hint" class="v-in" type="text" placeholder="PIN hint (optional)" style="${INPUT_CSS}" />
-    <button id="v-dl" style="${BTN_CANCEL_CSS};width:100%">Download encrypted backup</button>
+    <button id="v-dl" style="${BTN_CANCEL_CSS};width:100%;flex:none">Download encrypted backup</button>
     <div id="v-err" style="${ERR_CSS}"></div>
     <div style="display:flex;gap:10px">
       <button id="v-cancel" style="${BTN_CANCEL_CSS}">Cancel</button>
@@ -470,7 +470,7 @@ function showImportOverlay(): Promise<{ pubkey: string; seedId: string }> {
     <div style="${TITLE_CSS}">Import an account</div>
     <div style="color:#a1a1aa;font-size:13px">Paste a recovery phrase, an nsec, or the contents of a backup file — or choose a backup file.</div>
     <textarea id="v-secret" class="v-in" placeholder="word1 word2 …   /   nsec1…   /   backup JSON" style="${INPUT_CSS};height:88px;padding:10px 14px;resize:none;font-family:inherit"></textarea>
-    <label style="${BTN_CANCEL_CSS};display:flex;align-items:center;justify-content:center">Choose backup file<input id="v-file" type="file" accept="application/json,.json" style="display:none" /></label>
+    <label style="${BTN_CANCEL_CSS};display:flex;align-items:center;justify-content:center;flex:none">Choose backup file<input id="v-file" type="file" accept="application/json,.json" style="display:none" /></label>
     <input id="v-name" class="v-in" type="text" placeholder="Label (optional)" style="${INPUT_CSS}" />
     <input id="v-pin" class="v-in" type="password" inputmode="numeric" placeholder="Backup password, or a new PIN" style="${INPUT_CSS}" />
     <input id="v-hint" class="v-in" type="text" placeholder="PIN hint (optional)" style="${INPUT_CSS}" />
@@ -539,8 +539,8 @@ function showSecretReveal(secret: string, payload: BackupPayloadV1, label: strin
     <div style="${TITLE_CSS}">${isMnemonic ? 'Recovery phrase' : 'Private key (nsec)'}</div>
     <div style="color:#a1a1aa;font-size:13px;line-height:1.5">Keep this secret — anyone who has it controls this account.</div>
     ${revealBlock(inner)}
-    <button id="v-dl" style="${BTN_CANCEL_CSS};width:100%">Download encrypted backup</button>
-    <button id="v-ok" style="${BTN_OK_CSS};width:100%">Done</button>`
+    <button id="v-dl" style="${BTN_CANCEL_CSS};width:100%;flex:none">Download encrypted backup</button>
+    <button id="v-ok" style="${BTN_OK_CSS};width:100%;flex:none">Done</button>`
   wireReveal(card)
   ;(card.querySelector('#v-dl') as HTMLButtonElement).onclick = () => downloadBackup(payload, label)
   return new Promise<void>((resolve) => {
