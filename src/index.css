@@ -44,7 +44,7 @@
   --radius: 0.5rem;
 }
 
-/* ── Vault overlay component classes (match the app's look, centralized) ── */
+/* ── Vault overlay component classes — mirror the app's modal/button/input styles ── */
 @layer components {
   .v-backdrop {
     @apply fixed inset-0 flex items-center justify-center p-4 box-border text-foreground;
@@ -54,37 +54,42 @@
     -webkit-backdrop-filter: blur(8px);
     font: 14px/1.5 system-ui, -apple-system, sans-serif;
   }
+  /* App modal card: bg-popover/background, border-border, rounded-2xl, shadow-2xl, max-w-md. */
   .v-card {
-    @apply w-full max-w-[420px] max-h-[92vh] overflow-y-auto flex flex-col gap-4 bg-popover border border-border rounded-2xl p-6 box-border;
-    box-shadow: 0 24px 70px rgba(0, 0, 0, 0.6);
+    @apply w-full max-w-md max-h-[92vh] overflow-y-auto flex flex-col gap-4 bg-popover border border-border rounded-2xl shadow-2xl p-6 box-border;
   }
   .v-card > * { @apply shrink-0; }
-  .v-eyebrow { @apply text-[11px] font-semibold tracking-[0.06em] uppercase text-muted-foreground; }
-  .v-title { @apply text-lg font-bold text-foreground; }
+  /* App field label. */
+  .v-eyebrow { @apply text-xs font-medium tracking-wider uppercase text-muted-foreground; }
+  .v-title { @apply text-lg font-semibold text-foreground; }
   .v-note { @apply text-[13px] text-muted-foreground leading-relaxed; }
-  .v-inset { @apply flex flex-col gap-2.5 bg-secondary/40 border border-border rounded-xl p-3.5; }
+  .v-inset { @apply flex flex-col gap-2.5 bg-secondary/40 border border-border/50 rounded-xl p-3.5; }
+  /* App modal input: bg-secondary/40, border-border/50, rounded-xl, text-base→sm, focus primary/50. */
   .v-input {
-    @apply w-full h-12 rounded-xl border border-input bg-secondary/40 text-foreground px-3.5 text-base outline-none box-border;
+    @apply w-full h-11 rounded-xl border border-border/50 bg-secondary/40 text-foreground px-3 text-base outline-none box-border transition-colors;
   }
   .v-textarea {
-    @apply w-full h-[88px] rounded-xl border border-input bg-secondary/40 text-foreground px-3.5 py-2.5 text-base outline-none box-border resize-none;
+    @apply w-full h-[88px] rounded-xl border border-border/50 bg-secondary/40 text-foreground px-3 py-2.5 text-base outline-none box-border resize-none transition-colors;
     font-family: inherit;
   }
-  .v-input:focus, .v-textarea:focus { @apply border-primary; }
-  .v-input::placeholder, .v-textarea::placeholder { @apply text-muted-foreground/70; }
-  .v-row { @apply flex gap-2.5; }
-  .v-btn {
-    @apply h-12 rounded-xl border border-border bg-secondary/40 text-foreground text-sm cursor-pointer flex items-center justify-center px-4;
-  }
-  .v-btn:disabled { @apply opacity-60 cursor-default; }
+  .v-input:focus, .v-textarea:focus { @apply border-primary/50; }
+  .v-input::placeholder, .v-textarea::placeholder { @apply text-muted-foreground; }
+  .v-row { @apply flex gap-3; }
+  /* App Button variant=default (primary) at modal size (h-11 rounded-xl). */
   .v-btn-primary {
-    @apply h-12 rounded-xl border-0 bg-primary text-primary-foreground font-semibold text-sm cursor-pointer flex items-center justify-center px-4;
+    @apply h-11 rounded-xl border-0 bg-primary text-primary-foreground text-sm font-medium shadow cursor-pointer flex items-center justify-center gap-2 px-4 transition-colors;
   }
+  .v-btn-primary:hover { @apply bg-primary/90; }
+  .v-btn-primary:disabled { @apply opacity-50 pointer-events-none; }
+  /* App Button variant=outline. */
+  .v-btn {
+    @apply h-11 rounded-xl border border-input bg-background text-foreground text-sm font-medium cursor-pointer flex items-center justify-center gap-2 px-4 transition-colors;
+  }
+  .v-btn:hover { @apply bg-secondary; }
+  .v-btn:disabled { @apply opacity-50 pointer-events-none; }
   .v-grow { @apply flex-1; }
   .v-grow-lg { flex: 1.4; }
-  .v-chip {
-    @apply inline-flex gap-1.5 items-baseline bg-popover border border-border rounded-lg px-2.5 py-2 text-[13px] font-semibold text-foreground whitespace-nowrap;
-  }
+  .v-chip { @apply inline-flex gap-1.5 items-baseline bg-secondary/40 border border-border/50 rounded-lg px-2.5 py-2 text-[13px] font-medium text-foreground whitespace-nowrap; }
   .v-chip-n { @apply text-[10px] font-normal text-muted-foreground; }
   .v-err { @apply text-destructive text-xs min-h-4; }
   .v-words { @apply flex flex-wrap gap-2; }
