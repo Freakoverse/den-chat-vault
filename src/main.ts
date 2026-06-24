@@ -289,13 +289,13 @@ function promptPinAction<T>(
     <div class="v-title">${esc(opts.title)}</div>
     ${opts.subtitle ? `<div class="v-note">${esc(opts.subtitle)}</div>` : ''}
     ${opts.bodyHtml || ''}
-    <input id="v-pin" class="v-input" type="password" inputmode="numeric" placeholder="${esc(opts.placeholder || 'Enter PIN')}" />
+    ${pinField('v-pin', opts.placeholder || 'Enter PIN')}
     <div id="v-err" class="v-err"></div>
     <div class="v-row">
       <button id="v-cancel" class="v-btn v-grow">Cancel</button>
       <button id="v-ok" class="v-btn-primary v-grow-lg">${esc(opts.confirmLabel || 'Confirm')}</button>
     </div>`
-  const pinInput = card.querySelector('#v-pin') as HTMLInputElement
+  const pinInput = wirePinField(card, 'v-pin')
   const errEl = card.querySelector('#v-err') as HTMLDivElement
   const okBtn = card.querySelector('#v-ok') as HTMLButtonElement
   pinInput.focus()
@@ -381,6 +381,8 @@ const ICON = {
   fileUp: I('<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><polyline points="9 15 12 12 15 15"/>'),
   qr: I('<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3z"/><path d="M20 14v3"/><path d="M14 20h3"/><path d="M20 20v.01"/>'),
   x: I('<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>', 18),
+  hash: I('<line x1="4" y1="9" x2="20" y2="9"/><line x1="4" y1="15" x2="20" y2="15"/><line x1="10" y1="3" x2="8" y2="21"/><line x1="16" y1="3" x2="14" y2="21"/>', 16),
+  keyboard: I('<rect x="2" y="4" width="20" height="16" rx="2"/><path d="M6 8h.01M10 8h.01M14 8h.01M18 8h.01M8 12h.01M12 12h.01M16 12h.01M7 16h10"/>', 16),
 }
 
 /** Encode text as a QR data-URL (black-on-white so any scanner reads it). */
@@ -388,12 +390,31 @@ function qrDataUrl(text: string): Promise<string> {
   return QRCode.toDataURL(text, { errorCorrectionLevel: 'M', margin: 1, width: 320, color: { dark: '#000000', light: '#ffffff' } })
 }
 
-/** Toggle a password input's visibility via its sibling #v-eye button. */
-function wireEyeToggle(card: HTMLElement, inputSel: string): void {
-  const input = card.querySelector(inputSel) as HTMLInputElement | null
-  const eye = card.querySelector('#v-eye') as HTMLButtonElement | null
-  if (!input || !eye) return
-  eye.onclick = () => { const show = input.type === 'password'; input.type = show ? 'text' : 'password'; eye.innerHTML = show ? ICON.eyeOff : ICON.eye }
+/** A PIN field markup: password input + inline eye toggle + a numeric/keyboard switcher
+ *  (mobile-only, matching the app's PinInput). Wire it afterwards with wirePinField. */
+function pinField(id: string, placeholder: string): string {
+  return `<div class="flex gap-2 w-full">
+    <div class="relative flex-1">
+      <input id="${id}" class="v-input pr-10" type="password" inputmode="numeric" placeholder="${esc(placeholder)}" />
+      <button id="${id}-eye" class="v-eye" type="button" tabindex="-1">${ICON.eye}</button>
+    </div>
+    <button id="${id}-kbd" class="v-kbd md:hidden" type="button" tabindex="-1" title="Switch keyboard">${ICON.hash}</button>
+  </div>`
+}
+
+/** Wire a pinField's eye toggle + keyboard switcher. Returns the input element. */
+function wirePinField(card: HTMLElement, id: string): HTMLInputElement {
+  const input = card.querySelector('#' + id) as HTMLInputElement
+  const eye = card.querySelector('#' + id + '-eye') as HTMLButtonElement | null
+  const kbd = card.querySelector('#' + id + '-kbd') as HTMLButtonElement | null
+  if (eye) eye.onclick = () => { const show = input.type === 'password'; input.type = show ? 'text' : 'password'; eye.innerHTML = show ? ICON.eyeOff : ICON.eye }
+  if (kbd) kbd.onclick = () => {
+    const numeric = input.inputMode === 'numeric'
+    input.inputMode = numeric ? 'text' : 'numeric'
+    kbd.innerHTML = numeric ? ICON.keyboard : ICON.hash
+    input.focus()
+  }
+  return input
 }
 
 /** Open the camera, scan for a QR each frame, and call onResult once found. Returns a stop fn. */
@@ -442,20 +463,15 @@ function showGenerateReveal(mnemonic: string): Promise<{ pubkey: string; seedId:
         <p class="v-note text-center">Choose a PIN to protect your new account. You'll need it every time you log in.</p>
         <div class="v-warn v-warn-amber"><span class="shrink-0 mt-0.5">${ICON.alert}</span><div><b>There is no PIN recovery.</b> If you forget your PIN, your only option is to re-import using your raw seed phrase (the ${words.length} words).</div></div>
         <input id="v-name" class="v-input" type="text" placeholder="Local seed label (optional)" />
-        <div class="relative w-full">
-          <input id="v-pin" class="v-input pr-10" type="password" inputmode="numeric" placeholder="Enter PIN" />
-          <button id="v-eye" class="v-eye" type="button">${ICON.eye}</button>
-        </div>
+        ${pinField('v-pin', 'Enter PIN')}
         <input id="v-hint" class="v-input" type="text" placeholder="PIN hint (optional)" />
         ${err ? `<div class="v-warn v-warn-red"><span class="shrink-0">${ICON.alert}</span><span>${esc(err)}</span></div>` : ''}
         <button id="v-gen" class="v-btn-primary w-full">Generate New Seed</button>
         <button id="v-back" class="v-ghost">Back</button>`
       const nameI = card.querySelector('#v-name') as HTMLInputElement
-      const pinI = card.querySelector('#v-pin') as HTMLInputElement
+      const pinI = wirePinField(card, 'v-pin')
       const hintI = card.querySelector('#v-hint') as HTMLInputElement
-      const eye = card.querySelector('#v-eye') as HTMLButtonElement
       nameI.value = name; pinI.value = pin; hintI.value = hint; pinI.focus()
-      eye.onclick = () => { const show = pinI.type === 'password'; pinI.type = show ? 'text' : 'password'; eye.innerHTML = show ? ICON.eyeOff : ICON.eye }
       ;(card.querySelector('#v-gen') as HTMLButtonElement).onclick = () => {
         name = nameI.value.trim(); pin = pinI.value; hint = hintI.value.trim()
         if (pin.length < 4) { renderCreate('Set a PIN of at least 4 characters'); return }
@@ -478,7 +494,7 @@ function showGenerateReveal(mnemonic: string): Promise<{ pubkey: string; seedId:
         ${dlOpen ? `
           <div class="v-sub">
             <p class="text-xs text-muted-foreground">Re-enter your PIN to encrypt and download:</p>
-            <input id="v-dlpin" class="v-input" type="password" inputmode="numeric" placeholder="Enter your PIN" />
+            ${pinField('v-dlpin', 'Enter your PIN')}
             ${dlErr ? `<div class="v-err">${esc(dlErr)}</div>` : ''}
             <div class="flex gap-2">
               <button id="v-dlcancel" class="v-ghost flex-1">Cancel</button>
@@ -499,7 +515,7 @@ function showGenerateReveal(mnemonic: string): Promise<{ pubkey: string; seedId:
         try { await navigator.clipboard.writeText(mnemonic); copyBtn.innerHTML = `${ICON.check} Copied!`; setTimeout(() => { copyBtn.innerHTML = `${ICON.copy} Copy` }, 1500) } catch { /* clipboard blocked */ }
       }
       if (dlOpen) {
-        const dlpin = card.querySelector('#v-dlpin') as HTMLInputElement
+        const dlpin = wirePinField(card, 'v-dlpin')
         dlpin.focus()
         ;(card.querySelector('#v-dlcancel') as HTMLButtonElement).onclick = () => renderBackup(false)
         ;(card.querySelector('#v-dlgo') as HTMLButtonElement).onclick = async () => {
@@ -655,13 +671,12 @@ function showImportOverlay(): Promise<{ pubkey: string; seedId: string }> {
         <p class="v-note text-center">Protect this imported ${isSeed ? 'seed' : 'key'} with a PIN. You'll need it every time you log in.</p>
         <div class="v-warn v-warn-amber"><span class="shrink-0 mt-0.5">${ICON.alert}</span><div><b>There is no PIN recovery.</b> If you forget it, re-import using your secret.</div></div>
         <input id="v-name" class="v-input" type="text" placeholder="Label (optional)" />
-        <div class="relative w-full"><input id="v-pin" class="v-input pr-10" type="password" inputmode="numeric" placeholder="Set a PIN" /><button id="v-eye" class="v-eye" type="button">${ICON.eye}</button></div>
+        ${pinField('v-pin', 'Set a PIN')}
         <input id="v-hint" class="v-input" type="text" placeholder="PIN hint (optional)" />
         ${err ? `<div class="v-warn v-warn-red"><span class="shrink-0">${ICON.alert}</span><span>${esc(err)}</span></div>` : ''}
         <button id="v-imp" class="v-btn-primary w-full">Import &amp; Login</button>
         <button id="v-back" class="v-ghost">Back</button>`
-      wireEyeToggle(card, '#v-pin')
-      const pinI = card.querySelector('#v-pin') as HTMLInputElement
+      const pinI = wirePinField(card, 'v-pin')
       pinI.focus()
       ;(card.querySelector('#v-imp') as HTMLButtonElement).onclick = async () => {
         const pin = pinI.value
@@ -681,12 +696,11 @@ function showImportOverlay(): Promise<{ pubkey: string; seedId: string }> {
       card.innerHTML = `
         <div class="v-icon-row"><span class="text-primary">${ICON.lock}</span><h2 class="v-h2">Decrypt Backup</h2></div>
         <p class="v-note text-center">Enter the password used when this backup was created.</p>
-        <div class="relative w-full"><input id="v-pw" class="v-input pr-10" type="password" inputmode="numeric" placeholder="Backup password / PIN" /><button id="v-eye" class="v-eye" type="button">${ICON.eye}</button></div>
+        ${pinField('v-pw', 'Backup password / PIN')}
         ${err ? `<div class="v-warn v-warn-red"><span class="shrink-0">${ICON.alert}</span><span>${esc(err)}</span></div>` : ''}
         <button id="v-dec" class="v-btn-primary w-full">Decrypt</button>
         <button id="v-back" class="v-ghost">Cancel</button>`
-      wireEyeToggle(card, '#v-pw')
-      const pw = card.querySelector('#v-pw') as HTMLInputElement
+      const pw = wirePinField(card, 'v-pw')
       pw.focus()
       ;(card.querySelector('#v-dec') as HTMLButtonElement).onclick = async () => {
         if (!pw.value) { renderDecrypt(payload, 'Enter the backup password'); return }
@@ -768,13 +782,13 @@ function showChangePin(seedId: string): Promise<{ ok: boolean }> {
   card.innerHTML = `
     <div class="v-eyebrow">DEN Vault · Change PIN</div>
     <div class="v-title">Change PIN</div>
-    <input id="v-cur" class="v-input" type="password" inputmode="numeric" placeholder="Current PIN" />
-    <input id="v-new" class="v-input" type="password" inputmode="numeric" placeholder="New PIN" />
+    ${pinField('v-cur', 'Current PIN')}
+    ${pinField('v-new', 'New PIN')}
     <input id="v-hint" class="v-input" type="text" placeholder="New PIN hint (optional)" />
     <div id="v-err" class="v-err"></div>
     <div class="v-row"><button id="v-cancel" class="v-btn v-grow">Cancel</button><button id="v-ok" class="v-btn-primary v-grow-lg">Change PIN</button></div>`
-  const cur = card.querySelector('#v-cur') as HTMLInputElement
-  const nw = card.querySelector('#v-new') as HTMLInputElement
+  const cur = wirePinField(card, 'v-cur')
+  const nw = wirePinField(card, 'v-new')
   const hintEl = card.querySelector('#v-hint') as HTMLInputElement
   const errEl = card.querySelector('#v-err') as HTMLDivElement
   const okBtn = card.querySelector('#v-ok') as HTMLButtonElement

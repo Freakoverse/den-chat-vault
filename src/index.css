@@ -110,5 +110,7 @@
   .v-ghost { @apply w-full text-sm font-medium text-muted-foreground hover:text-foreground cursor-pointer bg-transparent border-0 py-2; }
   .v-sub { @apply w-full flex flex-col gap-2 p-3 rounded-lg border border-border bg-secondary/20 text-left; }
   .v-eye { @apply absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground cursor-pointer bg-transparent border-0 p-0; }
+  /* Numeric ↔ full-keyboard switcher beside a PIN field (mobile only, like the app). */
+  .v-kbd { @apply h-11 w-11 shrink-0 flex items-center justify-center rounded-xl border border-input bg-background text-muted-foreground hover:text-foreground hover:bg-secondary cursor-pointer transition-colors; }
   .v-ok { @apply flex items-center justify-center gap-1.5 text-xs text-emerald-500 w-full; }
 }
