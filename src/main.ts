@@ -211,7 +211,7 @@ interface TxDisplay { title: string; rows: Array<[string, string]> }
 
 /* ─── Shared overlay styling (matches the app's dark theme tokens) ─── */
 const BACKDROP_CSS = 'position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:16px;background:rgba(0,0,0,0.6);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);color:#fafafa;font:14px/1.5 system-ui,-apple-system,sans-serif;z-index:2147483647;box-sizing:border-box'
-const CARD_CSS = 'width:100%;max-width:400px;max-height:92vh;overflow-y:auto;display:flex;flex-direction:column;gap:14px;background:#171717;border:1px solid #27272a;border-radius:16px;padding:20px;box-shadow:0 24px 70px rgba(0,0,0,0.6);box-sizing:border-box'
+const CARD_CSS = 'width:100%;max-width:420px;max-height:92vh;overflow-y:auto;display:flex;flex-direction:column;gap:16px;background:#171717;border:1px solid #27272a;border-radius:20px;padding:24px;box-shadow:0 24px 70px rgba(0,0,0,0.6);box-sizing:border-box'
 const EYEBROW_CSS = 'color:#a1a1aa;font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase'
 const TITLE_CSS = 'font-size:18px;font-weight:700;color:#fafafa'
 const INPUT_CSS = 'width:100%;height:48px;border-radius:12px;border:1px solid #3f3f46;background:#1d1d20;color:#fafafa;padding:0 14px;font-size:16px;outline:none;box-sizing:border-box'
@@ -220,6 +220,42 @@ const BTN_CANCEL_CSS = 'flex:1;height:48px;border-radius:12px;border:1px solid #
 const BTN_OK_CSS = 'flex:1.4;height:48px;border-radius:12px;border:0;background:#4a6df7;color:#fafafa;font-weight:600;cursor:pointer;font-size:14px'
 const FOCUS_STYLE = '<style>.v-in:focus{border-color:#4a6df7}.v-in::placeholder{color:#71717a}</style>'
 const inset = (html: string) => `<div style="display:flex;flex-direction:column;gap:10px;background:#1d1d20;border:1px solid #2a2a2e;border-radius:12px;padding:14px">${html}</div>`
+
+/** Numbered word chips in a 3-column grid (recovery phrase). */
+function wordChips(words: string[]): string {
+  return `<div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px">${words.map((w, i) => `<span style="display:inline-flex;gap:6px;align-items:baseline;background:#171717;border:1px solid #2a2a2e;border-radius:8px;padding:7px 8px;font-size:13px"><span style="color:#71717a;font-size:10px;min-width:14px;text-align:right">${i + 1}</span><span style="font-weight:600;color:#fafafa;word-break:break-all">${esc(w)}</span></span>`).join('')}</div>`
+}
+
+/** Wrap secret content (phrase/nsec) in a blurred box behind a "make sure no one is watching"
+ *  cover + a Reveal button with a short countdown — mirrors the app's reveal flow. */
+function revealBlock(innerHtml: string): string {
+  return `<div style="position:relative">
+      <div id="v-secret-box" style="background:#1d1d20;border:1px solid #2a2a2e;border-radius:12px;padding:14px;max-height:42vh;overflow:auto;filter:blur(8px);user-select:none;transition:filter .25s">${innerHtml}</div>
+      <div id="v-cover" style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;text-align:center;padding:18px;background:rgba(23,23,23,0.6);border-radius:12px">
+        <div style="font-size:13px;color:#fafafa;font-weight:600">Reveal your secret?</div>
+        <div style="font-size:11px;color:#a1a1aa;max-width:250px;line-height:1.5">Make sure no one is watching your screen and nothing is recording.</div>
+        <button id="v-reveal" style="${BTN_OK_CSS};width:auto;flex:none;padding:0 20px;height:40px">Reveal</button>
+      </div>
+    </div>`
+}
+
+/** Wire the Reveal button (countdown → unblur). Call after the card HTML is in the DOM. */
+function wireReveal(card: HTMLElement): void {
+  const box = card.querySelector('#v-secret-box') as HTMLElement | null
+  const cover = card.querySelector('#v-cover') as HTMLElement | null
+  const btn = card.querySelector('#v-reveal') as HTMLButtonElement | null
+  if (!box || !cover || !btn) return
+  btn.onclick = () => {
+    btn.disabled = true
+    let n = 3
+    btn.textContent = String(n)
+    const t = setInterval(() => {
+      n -= 1
+      if (n <= 0) { clearInterval(t); box.style.filter = 'none'; cover.style.display = 'none' }
+      else btn.textContent = String(n)
+    }, 450)
+  }
+}
 
 /** Open the dimmed-backdrop overlay and return the (empty) card to fill + a close fn. */
 function openOverlay(): { card: HTMLDivElement; close: () => void } {
@@ -332,13 +368,12 @@ function downloadBackup(payload: BackupPayloadV1, label: string) {
 function showGenerateReveal(mnemonic: string): Promise<{ pubkey: string; seedId: string }> {
   const { card, close } = openOverlay()
   const words = mnemonic.split(' ')
-  const wordsHtml = words.map((w, i) => `<span style="display:inline-flex;gap:6px;align-items:baseline;background:#171717;border:1px solid #2a2a2e;border-radius:8px;padding:5px 9px;font-size:13px"><span style="color:#71717a;font-size:11px">${i + 1}</span><span style="font-weight:600;color:#fafafa">${esc(w)}</span></span>`).join('')
   card.innerHTML = `
     ${FOCUS_STYLE}
     <div style="${EYEBROW_CSS}">DEN Vault · New seed</div>
     <div style="${TITLE_CSS}">Back up your recovery phrase</div>
-    <div style="color:#a1a1aa;font-size:13px">Write these ${words.length} words down in order. They're the only way to recover your accounts — anyone who has them controls your funds.</div>
-    <div style="display:flex;flex-wrap:wrap;gap:8px;background:#1d1d20;border:1px solid #2a2a2e;border-radius:12px;padding:14px;max-height:34vh;overflow:auto">${wordsHtml}</div>
+    <div style="color:#a1a1aa;font-size:13px;line-height:1.5">Write these ${words.length} words down in order. They're the only way to recover your accounts — anyone who has them controls your funds.</div>
+    ${revealBlock(wordChips(words))}
     <input id="v-name" class="v-in" type="text" placeholder="Seed label (optional)" style="${INPUT_CSS}" />
     <input id="v-pin" class="v-in" type="password" inputmode="numeric" placeholder="Set a PIN to encrypt this seed" style="${INPUT_CSS}" />
     <input id="v-hint" class="v-in" type="text" placeholder="PIN hint (optional)" style="${INPUT_CSS}" />
@@ -348,6 +383,7 @@ function showGenerateReveal(mnemonic: string): Promise<{ pubkey: string; seedId:
       <button id="v-cancel" style="${BTN_CANCEL_CSS}">Cancel</button>
       <button id="v-ok" style="${BTN_OK_CSS}">I've saved it — Continue</button>
     </div>`
+  wireReveal(card)
   const nameInput = card.querySelector('#v-name') as HTMLInputElement
   const pinInput = card.querySelector('#v-pin') as HTMLInputElement
   const hintInput = card.querySelector('#v-hint') as HTMLInputElement
@@ -471,16 +507,17 @@ function showImportOverlay(): Promise<{ pubkey: string; seedId: string }> {
 function showSecretReveal(secret: string, payload: BackupPayloadV1, label: string): Promise<void> {
   const { card, close } = openOverlay()
   const isMnemonic = secret.trim().includes(' ')
-  const body = isMnemonic
-    ? `<div style="display:flex;flex-wrap:wrap;gap:8px;background:#1d1d20;border:1px solid #2a2a2e;border-radius:12px;padding:14px;max-height:34vh;overflow:auto">${secret.trim().split(/\s+/).map((w, i) => `<span style="display:inline-flex;gap:6px;align-items:baseline;background:#171717;border:1px solid #2a2a2e;border-radius:8px;padding:5px 9px;font-size:13px"><span style="color:#71717a;font-size:11px">${i + 1}</span><span style="font-weight:600;color:#fafafa">${esc(w)}</span></span>`).join('')}</div>`
-    : inset(`<span style="word-break:break-all;font-weight:600;color:#fafafa">${esc(secret)}</span>`)
+  const inner = isMnemonic
+    ? wordChips(secret.trim().split(/\s+/))
+    : `<span style="word-break:break-all;font-weight:600;color:#fafafa">${esc(secret)}</span>`
   card.innerHTML = `
     <div style="${EYEBROW_CSS}">DEN Vault · Secret</div>
     <div style="${TITLE_CSS}">${isMnemonic ? 'Recovery phrase' : 'Private key (nsec)'}</div>
-    <div style="color:#a1a1aa;font-size:13px">Keep this secret — anyone who has it controls this account.</div>
-    ${body}
+    <div style="color:#a1a1aa;font-size:13px;line-height:1.5">Keep this secret — anyone who has it controls this account.</div>
+    ${revealBlock(inner)}
     <button id="v-dl" style="${BTN_CANCEL_CSS};width:100%">Download encrypted backup</button>
     <button id="v-ok" style="${BTN_OK_CSS};width:100%">Done</button>`
+  wireReveal(card)
   ;(card.querySelector('#v-dl') as HTMLButtonElement).onclick = () => downloadBackup(payload, label)
   return new Promise<void>((resolve) => {
     ;(card.querySelector('#v-ok') as HTMLButtonElement).onclick = () => { close(); resolve() }
