@@ -1,7 +1,8 @@
 /**
- * DEN Vault — isolated signing origin.
+ * DEN Chat Vault — isolated signing origin.
  *
- * Runs at its own origin (e.g. https://vault.denchat.top), embedded as an iframe
+ * Runs at its own origin (https://denchat.dekev.top — a separate registrable domain
+ * from the app, so Site Isolation gives it its own process), embedded as an iframe
  * by the DEN app. The private key is generated, stored (encrypted), and used for
  * signing ENTIRELY here — it never enters the app's context. The app talks to the
  * vault only via postMessage ("sign this"), so an XSS in the app can't read the key.
@@ -285,7 +286,7 @@ function promptPinAction<T>(
 ): Promise<T> {
   const { card, close } = openOverlay()
   card.innerHTML = `
-    <div class="v-eyebrow">${esc(opts.eyebrow || 'DEN Vault')}</div>
+    <div class="v-eyebrow">${esc(opts.eyebrow || 'DEN Chat Vault')}</div>
     <div class="v-title">${esc(opts.title)}</div>
     ${opts.subtitle ? `<div class="v-note">${esc(opts.subtitle)}</div>` : ''}
     ${opts.bodyHtml || ''}
@@ -325,7 +326,7 @@ function promptPinAction<T>(
 function confirmAndSign(acct: AccountMeta, d: TxDisplay, sign: (privHex: string) => string): Promise<{ signed: string }> {
   const rows = d.rows.map(([k, v]) => `<div class="flex justify-between gap-4"><span class="text-muted-foreground shrink-0">${esc(k)}</span><span class="font-semibold text-right break-all">${esc(v)}</span></div>`).join('')
   return promptPinAction(
-    { title: d.title, eyebrow: 'DEN Vault · Secure confirm', bodyHtml: inset(rows), placeholder: 'Enter PIN to sign', confirmLabel: 'Confirm & Sign' },
+    { title: d.title, eyebrow: 'DEN Chat Vault · Secure confirm', bodyHtml: inset(rows), placeholder: 'Enter PIN to sign', confirmLabel: 'Confirm & Sign' },
     async (pin) => {
       await rateGuard(acct.seedId)
       const blob = await getSeedBlob(acct.seedId)
@@ -751,7 +752,7 @@ function showSecretReveal(secret: string, payload: BackupPayloadV1, label: strin
     ? wordChips(secret.trim().split(/\s+/))
     : `<span class="break-all font-semibold text-foreground">${esc(secret)}</span>`
   card.innerHTML = `
-    <div class="v-eyebrow">DEN Vault · Secret</div>
+    <div class="v-eyebrow">DEN Chat Vault · Secret</div>
     <div class="v-title">${isMnemonic ? 'Recovery phrase' : 'Private key (nsec)'}</div>
     <div class="v-note">Keep this secret — anyone who has it controls this account.</div>
     ${revealBlock(inner)}
@@ -780,7 +781,7 @@ function showSecretReveal(secret: string, payload: BackupPayloadV1, label: strin
 function showChangePin(seedId: string): Promise<{ ok: boolean }> {
   const { card, close } = openOverlay()
   card.innerHTML = `
-    <div class="v-eyebrow">DEN Vault · Change PIN</div>
+    <div class="v-eyebrow">DEN Chat Vault · Change PIN</div>
     <div class="v-title">Change PIN</div>
     ${pinField('v-cur', 'Current PIN')}
     ${pinField('v-new', 'New PIN')}
@@ -877,7 +878,7 @@ const ops: Record<string, (p?: any) => Promise<unknown>> = {
     if (!blob) throw new Error('No such seed')
     const seed = (await getSeeds()).find((s) => s.id === seedId)
     return promptPinAction(
-      { title: 'Add an account', eyebrow: 'DEN Vault · Derive', subtitle: seed?.hint ? `Hint: ${seed.hint}` : "Enter this seed's PIN to derive the next account.", confirmLabel: 'Add account' },
+      { title: 'Add an account', eyebrow: 'DEN Chat Vault · Derive', subtitle: seed?.hint ? `Hint: ${seed.hint}` : "Enter this seed's PIN to derive the next account.", confirmLabel: 'Add account' },
       async (pin) => {
         await rateGuard(seedId)
         let mnemonic: string
@@ -913,7 +914,7 @@ const ops: Record<string, (p?: any) => Promise<unknown>> = {
     if (!acct) throw new Error('No such account')
     const seed = (await getSeeds()).find((s) => s.id === acct.seedId)
     return promptPinAction(
-      { title: 'Unlock account', eyebrow: 'DEN Vault · Unlock', subtitle: seed?.hint ? `Hint: ${seed.hint}` : undefined, confirmLabel: 'Unlock' },
+      { title: 'Unlock account', eyebrow: 'DEN Chat Vault · Unlock', subtitle: seed?.hint ? `Hint: ${seed.hint}` : undefined, confirmLabel: 'Unlock' },
       async (pin) => {
         await rateGuard(acct.seedId)
         const blob = await getSeedBlob(acct.seedId)
@@ -951,7 +952,7 @@ const ops: Record<string, (p?: any) => Promise<unknown>> = {
     const acct = accounts.find((a) => a.pubkey === pubkey)
     if (!acct) return { ok: true }
     return promptPinAction(
-      { title: 'Remove account', eyebrow: 'DEN Vault · Remove', subtitle: 'Enter your PIN to confirm. Make sure you have a backup — this deletes the key from this device.', confirmLabel: 'Remove' },
+      { title: 'Remove account', eyebrow: 'DEN Chat Vault · Remove', subtitle: 'Enter your PIN to confirm. Make sure you have a backup — this deletes the key from this device.', confirmLabel: 'Remove' },
       async (pin) => {
         const blob = await getSeedBlob(acct.seedId)
         if (blob) { try { await decryptBackup(blob, pin) } catch { await rateFail(acct.seedId); throw new Error('Incorrect PIN') } }
@@ -987,7 +988,7 @@ const ops: Record<string, (p?: any) => Promise<unknown>> = {
     if (!blob) throw new Error('No such account')
     const seed = (await getSeeds()).find((s) => s.id === acct.seedId)
     const secret = await promptPinAction(
-      { title: 'Reveal secret', eyebrow: 'DEN Vault · Reveal', subtitle: seed?.hint ? `Hint: ${seed.hint}` : "Enter your PIN to reveal this account's secret.", confirmLabel: 'Reveal' },
+      { title: 'Reveal secret', eyebrow: 'DEN Chat Vault · Reveal', subtitle: seed?.hint ? `Hint: ${seed.hint}` : "Enter your PIN to reveal this account's secret.", confirmLabel: 'Reveal' },
       async (pin) => {
         await rateGuard(acct.seedId)
         let s: string
@@ -1127,7 +1128,7 @@ async function runSelfTest() {
   const el = document.getElementById('selftest')
   if (!el) return
   const line = (html: string) => { el.innerHTML += html + '<br>' }
-  line('<b>DEN Vault — feasibility self-test</b><br><span class="muted">Confirms key gen, the encrypted-blob format, IndexedDB persistence, and signing all work in <i>this</i> context (open this page inside your installed PWA to test standalone iOS).</span><br>')
+  line('<b>DEN Chat Vault — feasibility self-test</b><br><span class="muted">Confirms key gen, the encrypted-blob format, IndexedDB persistence, and signing all work in <i>this</i> context (open this page inside your installed PWA to test standalone iOS).</span><br>')
   try {
     line(`secure context: <span class="${window.isSecureContext ? 'ok' : 'fail'}">${window.isSecureContext}</span>`)
     const r = await ops.generate() as { mnemonic: string; pubkey: string }

@@ -1,4 +1,4 @@
-# DEN Vault
+# DEN Chat Vault
 
 An **isolated signing origin** for DEN Chat. It generates, stores (encrypted), and
 uses the Nostr private key entirely within its own origin, so the main app can only
