@@ -365,51 +365,165 @@ function downloadBackup(payload: BackupPayloadV1, label: string) {
   setTimeout(() => URL.revokeObjectURL(url), 1500)
 }
 
-/** Reveal the generated mnemonic + collect a label/PIN/hint — all in the overlay; persist on continue. */
+/** Inline lucide-style icons (stroke uses currentColor → tint via the parent text color). */
+const I = (p: string, size = 14) => `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:inline-block;vertical-align:-2px">${p}</svg>`
+const ICON = {
+  lock: I('<rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>', 20),
+  shield: I('<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>', 20),
+  alert: I('<circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>'),
+  eye: I('<path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/>'),
+  eyeOff: I('<path d="M9.9 4.24A9.12 9.12 0 0 1 12 5c7 0 10 7 10 7a13.2 13.2 0 0 1-1.67 2.68M6.6 6.6A13.5 13.5 0 0 0 2 12s3 7 10 7a9.7 9.7 0 0 0 5.4-1.6"/><line x1="2" y1="2" x2="22" y2="22"/>'),
+  copy: I('<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>'),
+  check: I('<polyline points="20 6 9 17 4 12"/>'),
+  download: I('<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>'),
+  fileUp: I('<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><polyline points="9 15 12 12 15 15"/>'),
+}
+
+/**
+ * Generate flow — mirrors the app's two-step Create Account → Backup screens, entirely in
+ * the overlay (label/PIN/hint, dot-hidden grid, reveal countdown, copy, encrypted download,
+ * re-upload verify). Persists only on Continue, so bailing leaves no orphan account.
+ */
 function showGenerateReveal(mnemonic: string): Promise<{ pubkey: string; seedId: string }> {
   const { card, close } = openOverlay()
+  card.classList.add('v-center')
   const words = mnemonic.split(' ')
-  card.innerHTML = `
-    <div class="v-eyebrow">DEN Vault · New seed</div>
-    <div class="v-title">Back up your recovery phrase</div>
-    <div class="v-note">Write these ${words.length} words down in order. They're the only way to recover your accounts — anyone who has them controls your funds.</div>
-    ${revealBlock(wordChips(words))}
-    <input id="v-name" class="v-input" type="text" placeholder="Seed label (optional)" />
-    <input id="v-pin" class="v-input" type="password" inputmode="numeric" placeholder="Set a PIN to encrypt this seed" />
-    <input id="v-hint" class="v-input" type="text" placeholder="PIN hint (optional)" />
-    <button id="v-dl" class="v-btn">Download encrypted backup</button>
-    <div id="v-err" class="v-err"></div>
-    <div class="v-row">
-      <button id="v-cancel" class="v-btn v-grow">Cancel</button>
-      <button id="v-ok" class="v-btn-primary v-grow-lg">I've saved it — Continue</button>
-    </div>`
-  wireReveal(card)
-  const nameInput = card.querySelector('#v-name') as HTMLInputElement
-  const pinInput = card.querySelector('#v-pin') as HTMLInputElement
-  const hintInput = card.querySelector('#v-hint') as HTMLInputElement
-  const errEl = card.querySelector('#v-err') as HTMLDivElement
-  const okBtn = card.querySelector('#v-ok') as HTMLButtonElement
-  const dlBtn = card.querySelector('#v-dl') as HTMLButtonElement
-  pinInput.focus()
-  return new Promise((resolve, reject) => {
-    dlBtn.onclick = async () => {
-      const pin = pinInput.value
-      if (pin.length < 4) { errEl.textContent = 'Set a PIN (4+ characters) before downloading'; return }
-      try { downloadBackup(await encryptBackup(mnemonic, pin), deriveKeypair(mnemonic).pubHex.slice(0, 8)) }
-      catch { errEl.textContent = 'Could not create the backup file' }
+  let pin = '', name = '', hint = ''
+  let revealed = false, downloaded = false, verified = false
+
+  return new Promise<{ pubkey: string; seedId: string }>((resolve, reject) => {
+    // ── Step 1: Create Account (set the PIN) ──
+    function renderCreate(err?: string) {
+      card.innerHTML = `
+        <div class="v-icon-row"><span class="text-primary">${ICON.lock}</span><h2 class="v-h2">Create Account</h2></div>
+        <p class="v-note text-center">Choose a PIN to protect your new account. You'll need it every time you log in.</p>
+        <div class="v-warn v-warn-amber"><span class="shrink-0 mt-0.5">${ICON.alert}</span><div><b>There is no PIN recovery.</b> If you forget your PIN, your only option is to re-import using your raw seed phrase (the ${words.length} words).</div></div>
+        <input id="v-name" class="v-input" type="text" placeholder="Local seed label (optional)" />
+        <div class="relative w-full">
+          <input id="v-pin" class="v-input pr-10" type="password" inputmode="numeric" placeholder="Enter PIN" />
+          <button id="v-eye" class="v-eye" type="button">${ICON.eye}</button>
+        </div>
+        <input id="v-hint" class="v-input" type="text" placeholder="PIN hint (optional)" />
+        ${err ? `<div class="v-warn v-warn-red"><span class="shrink-0">${ICON.alert}</span><span>${esc(err)}</span></div>` : ''}
+        <button id="v-gen" class="v-btn-primary w-full">Generate New Seed</button>
+        <button id="v-back" class="v-ghost">Back</button>`
+      const nameI = card.querySelector('#v-name') as HTMLInputElement
+      const pinI = card.querySelector('#v-pin') as HTMLInputElement
+      const hintI = card.querySelector('#v-hint') as HTMLInputElement
+      const eye = card.querySelector('#v-eye') as HTMLButtonElement
+      nameI.value = name; pinI.value = pin; hintI.value = hint; pinI.focus()
+      eye.onclick = () => { const show = pinI.type === 'password'; pinI.type = show ? 'text' : 'password'; eye.innerHTML = show ? ICON.eyeOff : ICON.eye }
+      ;(card.querySelector('#v-gen') as HTMLButtonElement).onclick = () => {
+        name = nameI.value.trim(); pin = pinI.value; hint = hintI.value.trim()
+        if (pin.length < 4) { renderCreate('Set a PIN of at least 4 characters'); return }
+        renderBackup()
+      }
+      ;(card.querySelector('#v-back') as HTMLButtonElement).onclick = () => { close(); reject(new Error('Cancelled')) }
     }
-    okBtn.onclick = async () => {
-      const pin = pinInput.value
-      if (pin.length < 4) { errEl.textContent = 'Set a PIN of at least 4 characters'; return }
-      okBtn.disabled = true
-      try {
-        const r = await persistGeneratedSeed(mnemonic, pin, nameInput.value.trim() || undefined, hintInput.value.trim() || undefined)
-        close(); resolve(r)
-      } catch (e) {
-        errEl.textContent = e instanceof Error ? e.message : 'Could not save'; okBtn.disabled = false
+
+    // ── Step 2: Backup ──
+    function renderBackup(dlOpen = false, dlErr?: string) {
+      const grid = words.map((w, i) => `<div class="v-word"><span class="v-word-n">${i + 1}.</span><span class="v-word-v">${revealed ? esc(w) : '••••'}</span></div>`).join('')
+      card.innerHTML = `
+        <div class="v-icon-row"><span class="text-primary">${ICON.shield}</span><h2 class="v-h2">Backup Seed Phrase</h2></div>
+        <div class="v-warn v-warn-red"><span class="shrink-0 mt-0.5">${ICON.alert}</span><span>Write down these words and store them securely. Anyone with these words can access your keys and funds.</span></div>
+        <div class="v-wordgrid">${grid}</div>
+        <div class="flex gap-2 w-full">
+          <button id="v-reveal" class="v-pill flex-1">${revealed ? ICON.eyeOff + ' Censor' : ICON.eye + ' Reveal'}</button>
+          <button id="v-copy" class="v-pill flex-1">${ICON.copy} Copy</button>
+        </div>
+        ${dlOpen ? `
+          <div class="v-sub">
+            <p class="text-xs text-muted-foreground">Re-enter your PIN to encrypt and download:</p>
+            <input id="v-dlpin" class="v-input" type="password" inputmode="numeric" placeholder="Enter your PIN" />
+            ${dlErr ? `<div class="v-err">${esc(dlErr)}</div>` : ''}
+            <div class="flex gap-2">
+              <button id="v-dlcancel" class="v-ghost flex-1">Cancel</button>
+              <button id="v-dlgo" class="v-btn-primary flex-1">${ICON.download} Encrypt &amp; Download</button>
+            </div>
+          </div>`
+        : `<button id="v-dl" class="v-btn w-full">${ICON.download} Download Encrypted Backup</button>`}
+        ${downloaded && !verified ? `<button id="v-verify" class="v-btn w-full">${ICON.fileUp} Re-upload backup to verify</button><input id="v-vfile" type="file" accept="application/json,.json" class="hidden" />` : ''}
+        ${verified ? `<div class="v-ok">${ICON.check} Backup verified</div>` : ''}
+        <div id="v-verr" class="v-err"></div>
+        <button id="v-cont" class="v-btn-primary w-full" ${(!downloaded || !verified) ? 'disabled' : ''}>${!downloaded ? 'Download backup to continue' : !verified ? 'Verify your backup to continue' : "I've Saved My Seed · Continue"}</button>`
+      const verr = card.querySelector('#v-verr') as HTMLDivElement
+      ;(card.querySelector('#v-reveal') as HTMLButtonElement).onclick = () => {
+        if (revealed) { revealed = false; renderBackup(dlOpen) } else renderRevealConfirm(dlOpen)
+      }
+      const copyBtn = card.querySelector('#v-copy') as HTMLButtonElement
+      copyBtn.onclick = async () => {
+        try { await navigator.clipboard.writeText(mnemonic); copyBtn.innerHTML = `${ICON.check} Copied!`; setTimeout(() => { copyBtn.innerHTML = `${ICON.copy} Copy` }, 1500) } catch { /* clipboard blocked */ }
+      }
+      if (dlOpen) {
+        const dlpin = card.querySelector('#v-dlpin') as HTMLInputElement
+        dlpin.focus()
+        ;(card.querySelector('#v-dlcancel') as HTMLButtonElement).onclick = () => renderBackup(false)
+        ;(card.querySelector('#v-dlgo') as HTMLButtonElement).onclick = async () => {
+          if (dlpin.value !== pin) { renderBackup(true, "That PIN doesn't match the one you set"); return }
+          try { downloadBackup(await encryptBackup(mnemonic, pin), deriveKeypair(mnemonic).pubHex.slice(0, 8)); downloaded = true; renderBackup(false) }
+          catch { renderBackup(true, 'Could not create the backup file') }
+        }
+      } else {
+        ;(card.querySelector('#v-dl') as HTMLButtonElement).onclick = () => renderBackup(true)
+      }
+      if (downloaded && !verified) {
+        const vfile = card.querySelector('#v-vfile') as HTMLInputElement
+        ;(card.querySelector('#v-verify') as HTMLButtonElement).onclick = () => vfile.click()
+        vfile.onchange = async () => {
+          const f = vfile.files?.[0]; if (!f) return
+          try {
+            const secret = await decryptBackup(JSON.parse(await f.text()), pin)
+            if (secret.trim() === mnemonic.trim()) { verified = true; renderBackup(false) }
+            else verr.textContent = "That file doesn't match this seed"
+          } catch { verr.textContent = 'Could not verify that file' }
+        }
+      }
+      const cont = card.querySelector('#v-cont') as HTMLButtonElement
+      cont.onclick = async () => {
+        if (!downloaded || !verified) return
+        cont.disabled = true
+        try { const r = await persistGeneratedSeed(mnemonic, pin, name || undefined, hint || undefined); close(); resolve(r) }
+        catch (e) { verr.textContent = e instanceof Error ? e.message : 'Could not save'; cont.disabled = false }
       }
     }
-    ;(card.querySelector('#v-cancel') as HTMLButtonElement).onclick = () => { close(); reject(new Error('Cancelled')) }
+
+    // ── Reveal gate: confirm → countdown (card-content swap) ──
+    function renderRevealConfirm(dlOpen: boolean) {
+      card.innerHTML = `
+        <div class="flex items-center justify-center w-12 h-12 rounded-full bg-destructive/10 text-destructive mx-auto">${ICON.alert}</div>
+        <h2 class="v-h2" style="font-size:18px">Reveal your secret keys?</h2>
+        <p class="v-note text-center">These ${words.length} words <b>are</b> your account. Anyone who sees them gains <b class="text-destructive">full and permanent control</b> of your funds. There is no recovery and no undo.</p>
+        <p class="text-xs text-muted-foreground">Make sure no one is watching your screen and nothing is recording.</p>
+        <div class="v-row w-full">
+          <button id="v-rc" class="v-btn flex-1">Cancel</button>
+          <button id="v-ry" class="v-btn-primary flex-1" style="background:hsl(var(--destructive))">${ICON.eye} Yes, show</button>
+        </div>`
+      ;(card.querySelector('#v-rc') as HTMLButtonElement).onclick = () => renderBackup(dlOpen)
+      ;(card.querySelector('#v-ry') as HTMLButtonElement).onclick = () => renderCountdown(dlOpen)
+    }
+    function renderCountdown(dlOpen: boolean) {
+      let n = 5
+      let timer: ReturnType<typeof setInterval> | null = null
+      const draw = () => {
+        card.innerHTML = `
+          <div class="relative flex items-center justify-center w-16 h-16 text-destructive mx-auto">
+            <svg class="animate-spin w-16 h-16" viewBox="0 0 24 24" fill="none" style="opacity:.4"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3"/></svg>
+            <span class="absolute text-2xl font-bold text-foreground">${n}</span>
+          </div>
+          <h2 class="v-h2" style="font-size:18px">Showing keys in ${n}…</h2>
+          <p class="v-note text-center">Last chance — make sure no one can see your screen.</p>
+          <button id="v-nw" class="v-btn w-full">${ICON.eyeOff} Wait, never mind</button>`
+        ;(card.querySelector('#v-nw') as HTMLButtonElement).onclick = () => { if (timer) clearInterval(timer); renderBackup(dlOpen) }
+      }
+      draw()
+      timer = setInterval(() => {
+        n -= 1
+        if (n <= 0) { if (timer) clearInterval(timer); revealed = true; renderBackup(dlOpen) } else draw()
+      }, 1000)
+    }
+
+    renderCreate()
   })
 }
 

@@ -93,4 +93,22 @@
   .v-chip-n { @apply text-[10px] font-normal text-muted-foreground; }
   .v-err { @apply text-destructive text-xs min-h-4; }
   .v-words { @apply flex flex-wrap gap-2; }
+
+  /* ── Generate / backup flow (mirrors the app's auth screens) ── */
+  .v-center { @apply items-center text-center; }            /* centered card content */
+  .v-icon-row { @apply flex items-center justify-center gap-2; }
+  .v-h2 { @apply text-xl font-bold text-foreground; }       /* auth-screen title */
+  .v-warn { @apply flex items-start gap-2 px-3 py-2 rounded-lg w-full text-xs text-left; }
+  .v-warn-red { @apply bg-destructive/10 border border-destructive/30 text-destructive; }
+  .v-warn-amber { @apply bg-amber-500/10 border border-amber-500/30 text-amber-500; }
+  .v-wordgrid { @apply grid grid-cols-3 gap-2 w-full; }
+  .v-word { @apply flex items-center gap-2 p-2 bg-secondary/50 rounded-lg border border-border; }
+  .v-word-n { @apply text-[10px] text-muted-foreground w-5 text-right shrink-0; }
+  .v-word-v { @apply font-mono text-sm; }
+  .v-pill { @apply flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg bg-secondary/50 border border-border text-xs cursor-pointer transition-colors; }
+  .v-pill:hover { @apply bg-secondary; }
+  .v-ghost { @apply w-full text-sm font-medium text-muted-foreground hover:text-foreground cursor-pointer bg-transparent border-0 py-2; }
+  .v-sub { @apply w-full flex flex-col gap-2 p-3 rounded-lg border border-border bg-secondary/20 text-left; }
+  .v-eye { @apply absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground cursor-pointer bg-transparent border-0 p-0; }
+  .v-ok { @apply flex items-center justify-center gap-1.5 text-xs text-emerald-500 w-full; }
 }
