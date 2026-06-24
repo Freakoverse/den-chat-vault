@@ -221,9 +221,9 @@ const BTN_OK_CSS = 'flex:1.4;height:52px;border-radius:12px;border:0;background:
 const FOCUS_STYLE = '<style>.v-in:focus{border-color:#4a6df7}.v-in::placeholder{color:#71717a}</style>'
 const inset = (html: string) => `<div style="display:flex;flex-direction:column;gap:10px;background:#1d1d20;border:1px solid #2a2a2e;border-radius:12px;padding:14px">${html}</div>`
 
-/** Numbered word chips in a 3-column grid (recovery phrase) — words never wrap mid-letter. */
+/** Numbered word chips that wrap as whole units — each chip sizes to its word, never clipped. */
 function wordChips(words: string[]): string {
-  return `<div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px">${words.map((w, i) => `<span style="display:flex;gap:6px;align-items:baseline;background:#171717;border:1px solid #2a2a2e;border-radius:8px;padding:8px 10px;font-size:13px;white-space:nowrap;overflow:hidden"><span style="color:#71717a;font-size:10px;min-width:14px;text-align:right;flex:none">${i + 1}</span><span style="font-weight:600;color:#fafafa">${esc(w)}</span></span>`).join('')}</div>`
+  return `<div style="display:flex;flex-wrap:wrap;gap:8px">${words.map((w, i) => `<span style="display:inline-flex;gap:6px;align-items:baseline;background:#171717;border:1px solid #2a2a2e;border-radius:8px;padding:8px 11px;font-size:13px;white-space:nowrap"><span style="color:#71717a;font-size:10px">${i + 1}</span><span style="font-weight:600;color:#fafafa">${esc(w)}</span></span>`).join('')}</div>`
 }
 
 /** Wrap secret content (phrase/nsec) in a blurred box behind a "make sure no one is watching"
@@ -275,9 +275,18 @@ function wireReveal(card: HTMLElement): void {
 /** Open the dimmed-backdrop overlay and return the (empty) card to fill + a close fn. */
 function openOverlay(): { card: HTMLDivElement; close: () => void } {
   showTxOverlay(true)
+  // Keep the card's children at their natural height (scroll the card instead of
+  // squishing inputs/buttons when the content is taller than the viewport).
+  if (!document.getElementById('v-card-style')) {
+    const st = document.createElement('style')
+    st.id = 'v-card-style'
+    st.textContent = '.v-card>*{flex-shrink:0}'
+    document.head.appendChild(st)
+  }
   const backdrop = document.createElement('div')
   backdrop.style.cssText = BACKDROP_CSS
   const card = document.createElement('div')
+  card.className = 'v-card'
   card.style.cssText = CARD_CSS
   backdrop.appendChild(card)
   document.body.appendChild(backdrop)
