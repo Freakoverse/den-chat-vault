@@ -16,6 +16,8 @@
  */
 
 import './index.css'
+import QRCode from 'qrcode'
+import jsQR from 'jsqr'
 import { generateMnemonic, mnemonicToSeedSync, validateMnemonic } from '@scure/bip39'
 import { wordlist } from '@scure/bip39/wordlists/english'
 import { HDKey } from '@scure/bip32'
@@ -377,6 +379,47 @@ const ICON = {
   check: I('<polyline points="20 6 9 17 4 12"/>'),
   download: I('<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>'),
   fileUp: I('<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><polyline points="9 15 12 12 15 15"/>'),
+  qr: I('<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3z"/><path d="M20 14v3"/><path d="M14 20h3"/><path d="M20 20v.01"/>'),
+  x: I('<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>', 18),
+}
+
+/** Encode text as a QR data-URL (black-on-white so any scanner reads it). */
+function qrDataUrl(text: string): Promise<string> {
+  return QRCode.toDataURL(text, { errorCorrectionLevel: 'M', margin: 1, width: 320, color: { dark: '#000000', light: '#ffffff' } })
+}
+
+/** Toggle a password input's visibility via its sibling #v-eye button. */
+function wireEyeToggle(card: HTMLElement, inputSel: string): void {
+  const input = card.querySelector(inputSel) as HTMLInputElement | null
+  const eye = card.querySelector('#v-eye') as HTMLButtonElement | null
+  if (!input || !eye) return
+  eye.onclick = () => { const show = input.type === 'password'; input.type = show ? 'text' : 'password'; eye.innerHTML = show ? ICON.eyeOff : ICON.eye }
+}
+
+/** Open the camera, scan for a QR each frame, and call onResult once found. Returns a stop fn. */
+function startScan(video: HTMLVideoElement, onResult: (text: string) => void, onError: (msg: string) => void): () => void {
+  let raf = 0, stream: MediaStream | null = null, stopped = false
+  const canvas = document.createElement('canvas')
+  const ctx = canvas.getContext('2d', { willReadFrequently: true })
+  navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } })
+    .then((s) => {
+      if (stopped) { s.getTracks().forEach((t) => t.stop()); return }
+      stream = s; video.srcObject = s; void video.play()
+      const tick = () => {
+        if (stopped) return
+        if (ctx && video.readyState >= 2 && video.videoWidth) {
+          canvas.width = video.videoWidth; canvas.height = video.videoHeight
+          ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
+          const img = ctx.getImageData(0, 0, canvas.width, canvas.height)
+          const code = jsQR(img.data, img.width, img.height)
+          if (code?.data) { onResult(code.data); return }
+        }
+        raf = requestAnimationFrame(tick)
+      }
+      raf = requestAnimationFrame(tick)
+    })
+    .catch(() => onError('Camera unavailable or permission denied'))
+  return () => { stopped = true; cancelAnimationFrame(raf); stream?.getTracks().forEach((t) => t.stop()); video.srcObject = null }
 }
 
 /**
@@ -551,66 +594,136 @@ function tryParseBackup(raw: string): BackupPayloadV1 | null {
   return null
 }
 
-/** Collect the secret (paste or file) + PIN entirely in the overlay; the secret never reaches the app. */
+/**
+ * Import flow — mirrors the app: Import Account (paste / Backup File / Scan QR) → either
+ * "Set a PIN" (raw secret) or "Decrypt Backup" (encrypted file/QR). All secret/PIN handling
+ * stays in the overlay; the QR scan + decode also run here (only ciphertext leaves the camera).
+ */
 function showImportOverlay(): Promise<{ pubkey: string; seedId: string }> {
   const { card, close } = openOverlay()
-  card.innerHTML = `
-    <div class="v-eyebrow">DEN Vault · Import</div>
-    <div class="v-title">Import an account</div>
-    <div class="v-note">Paste a recovery phrase, an nsec, or the contents of a backup file — or choose a backup file.</div>
-    <textarea id="v-secret" class="v-textarea" placeholder="word1 word2 …   /   nsec1…   /   backup JSON"></textarea>
-    <label class="v-btn">Choose backup file<input id="v-file" type="file" accept="application/json,.json" class="hidden" /></label>
-    <input id="v-name" class="v-input" type="text" placeholder="Label (optional)" />
-    <input id="v-pin" class="v-input" type="password" inputmode="numeric" placeholder="Backup password, or a new PIN" />
-    <input id="v-hint" class="v-input" type="text" placeholder="PIN hint (optional)" />
-    <div id="v-err" class="v-err"></div>
-    <div class="v-row">
-      <button id="v-cancel" class="v-btn v-grow">Cancel</button>
-      <button id="v-ok" class="v-btn-primary v-grow-lg">Import</button>
-    </div>`
-  const secretInput = card.querySelector('#v-secret') as HTMLTextAreaElement
-  const fileInput = card.querySelector('#v-file') as HTMLInputElement
-  const nameInput = card.querySelector('#v-name') as HTMLInputElement
-  const pinInput = card.querySelector('#v-pin') as HTMLInputElement
-  const hintInput = card.querySelector('#v-hint') as HTMLInputElement
-  const errEl = card.querySelector('#v-err') as HTMLDivElement
-  const okBtn = card.querySelector('#v-ok') as HTMLButtonElement
-  secretInput.focus()
-  return new Promise((resolve, reject) => {
-    fileInput.onchange = async () => {
-      const f = fileInput.files?.[0]
-      if (!f) return
-      try { secretInput.value = await f.text() } catch { errEl.textContent = 'Could not read that file' }
-    }
-    okBtn.onclick = async () => {
-      const raw = secretInput.value.trim()
-      const pin = pinInput.value
-      const name = nameInput.value.trim() || undefined
-      const hint = hintInput.value.trim() || undefined
-      if (!raw) { errEl.textContent = 'Paste your phrase, nsec, or backup'; return }
-      if (pin.length < 4) { errEl.textContent = 'Enter the backup password or a new PIN'; return }
-      okBtn.disabled = true
-      try {
+  card.classList.add('v-center')
+  let stopScan: (() => void) | null = null
+  const cleanup = () => { if (stopScan) { stopScan(); stopScan = null } }
+
+  return new Promise<{ pubkey: string; seedId: string }>((resolve, reject) => {
+    const finish = (r: { pubkey: string; seedId: string }) => { cleanup(); close(); resolve(r) }
+
+    // ── Import Account (paste / file / scan) ──
+    function renderMain(err?: string) {
+      card.classList.add('v-center')
+      card.innerHTML = `
+        <h2 class="v-h2">Import Account</h2>
+        <p class="v-note text-center">Enter your 24-word seed phrase, nsec, or hex private key.</p>
+        <textarea id="v-secret" class="v-textarea h-[120px]" placeholder="word1 word2 word3 … (24 words) or nsec1… or hex"></textarea>
+        ${err ? `<div class="v-warn v-warn-red"><span class="shrink-0">${ICON.alert}</span><span>${esc(err)}</span></div>` : ''}
+        <button id="v-cont" class="v-btn-primary w-full">Continue</button>
+        <div class="flex items-center gap-3 w-full text-xs text-muted-foreground"><span class="flex-1 h-px bg-border"></span>or<span class="flex-1 h-px bg-border"></span></div>
+        <div class="flex gap-2 w-full">
+          <button id="v-filebtn" class="v-btn flex-1">${ICON.fileUp} Backup File</button>
+          <button id="v-scanbtn" class="v-btn flex-1">${ICON.qr} Scan QR</button>
+          <input id="v-file" type="file" accept="application/json,.json" class="hidden" />
+        </div>
+        <button id="v-back" class="v-ghost">Back</button>`
+      const ta = card.querySelector('#v-secret') as HTMLTextAreaElement
+      ta.focus()
+      ;(card.querySelector('#v-cont') as HTMLButtonElement).onclick = () => {
+        const raw = ta.value.trim()
+        if (!raw) { renderMain('Enter your seed phrase, nsec, or key'); return }
         const payload = tryParseBackup(raw)
-        let r: { pubkey: string; seedId: string }
-        if (payload) {
-          // Encrypted backup: the PIN is its password; the payload becomes the at-rest blob.
-          let secret: string
-          try { secret = await decryptBackup(payload, pin) }
-          catch { throw new Error('Wrong password for this backup file') }
-          r = await persistSecretBlob(secret, payload, name, hint)
-        } else {
-          // Raw secret: validate, then encrypt with the new PIN.
-          if (raw.includes(' ')) { if (!validateMnemonic(raw, wordlist)) throw new Error('Invalid recovery phrase') }
-          else { try { keypairFromSecret(raw, 0) } catch { throw new Error('Not a valid nsec / key') } }
-          r = await persistSecretBlob(raw, await encryptBackup(raw, pin), name, hint)
-        }
-        close(); resolve(r)
-      } catch (e) {
-        errEl.textContent = e instanceof Error ? e.message : 'Import failed'; okBtn.disabled = false
+        if (payload) { renderDecrypt(payload); return }
+        if (raw.includes(' ')) { if (!validateMnemonic(raw, wordlist)) { renderMain("That doesn't look like a valid recovery phrase"); return } }
+        else { try { keypairFromSecret(raw, 0) } catch { renderMain("That doesn't look like a valid nsec / key"); return } }
+        renderSetPin(raw)
       }
+      const fileInput = card.querySelector('#v-file') as HTMLInputElement
+      ;(card.querySelector('#v-filebtn') as HTMLButtonElement).onclick = () => fileInput.click()
+      fileInput.onchange = async () => {
+        const f = fileInput.files?.[0]; if (!f) return
+        try { const payload = tryParseBackup(await f.text()); if (payload) renderDecrypt(payload); else renderMain("That file isn't a valid DEN backup") }
+        catch { renderMain('Could not read that file') }
+      }
+      ;(card.querySelector('#v-scanbtn') as HTMLButtonElement).onclick = () => renderScan()
+      ;(card.querySelector('#v-back') as HTMLButtonElement).onclick = () => { cleanup(); close(); reject(new Error('Cancelled')) }
     }
-    ;(card.querySelector('#v-cancel') as HTMLButtonElement).onclick = () => { close(); reject(new Error('Cancelled')) }
+
+    // ── Set a PIN (raw secret) ──
+    function renderSetPin(secret: string, err?: string) {
+      card.classList.add('v-center')
+      const isSeed = secret.includes(' ')
+      card.innerHTML = `
+        <div class="v-icon-row"><span class="text-primary">${ICON.lock}</span><h2 class="v-h2">Set a PIN</h2></div>
+        <p class="v-note text-center">Protect this imported ${isSeed ? 'seed' : 'key'} with a PIN. You'll need it every time you log in.</p>
+        <div class="v-warn v-warn-amber"><span class="shrink-0 mt-0.5">${ICON.alert}</span><div><b>There is no PIN recovery.</b> If you forget it, re-import using your secret.</div></div>
+        <input id="v-name" class="v-input" type="text" placeholder="Label (optional)" />
+        <div class="relative w-full"><input id="v-pin" class="v-input pr-10" type="password" inputmode="numeric" placeholder="Set a PIN" /><button id="v-eye" class="v-eye" type="button">${ICON.eye}</button></div>
+        <input id="v-hint" class="v-input" type="text" placeholder="PIN hint (optional)" />
+        ${err ? `<div class="v-warn v-warn-red"><span class="shrink-0">${ICON.alert}</span><span>${esc(err)}</span></div>` : ''}
+        <button id="v-imp" class="v-btn-primary w-full">Import &amp; Login</button>
+        <button id="v-back" class="v-ghost">Back</button>`
+      wireEyeToggle(card, '#v-pin')
+      const pinI = card.querySelector('#v-pin') as HTMLInputElement
+      pinI.focus()
+      ;(card.querySelector('#v-imp') as HTMLButtonElement).onclick = async () => {
+        const pin = pinI.value
+        if (pin.length < 4) { renderSetPin(secret, 'Set a PIN of at least 4 characters'); return }
+        const name = (card.querySelector('#v-name') as HTMLInputElement).value.trim() || undefined
+        const hint = (card.querySelector('#v-hint') as HTMLInputElement).value.trim() || undefined
+        ;(card.querySelector('#v-imp') as HTMLButtonElement).disabled = true
+        try { finish(await persistSecretBlob(secret, await encryptBackup(secret, pin), name, hint)) }
+        catch (e) { renderSetPin(secret, e instanceof Error ? e.message : 'Import failed') }
+      }
+      ;(card.querySelector('#v-back') as HTMLButtonElement).onclick = () => renderMain()
+    }
+
+    // ── Decrypt Backup (encrypted file / QR) ──
+    function renderDecrypt(payload: BackupPayloadV1, err?: string) {
+      card.classList.add('v-center')
+      card.innerHTML = `
+        <div class="v-icon-row"><span class="text-primary">${ICON.lock}</span><h2 class="v-h2">Decrypt Backup</h2></div>
+        <p class="v-note text-center">Enter the password used when this backup was created.</p>
+        <div class="relative w-full"><input id="v-pw" class="v-input pr-10" type="password" inputmode="numeric" placeholder="Backup password / PIN" /><button id="v-eye" class="v-eye" type="button">${ICON.eye}</button></div>
+        ${err ? `<div class="v-warn v-warn-red"><span class="shrink-0">${ICON.alert}</span><span>${esc(err)}</span></div>` : ''}
+        <button id="v-dec" class="v-btn-primary w-full">Decrypt</button>
+        <button id="v-back" class="v-ghost">Cancel</button>`
+      wireEyeToggle(card, '#v-pw')
+      const pw = card.querySelector('#v-pw') as HTMLInputElement
+      pw.focus()
+      ;(card.querySelector('#v-dec') as HTMLButtonElement).onclick = async () => {
+        if (!pw.value) { renderDecrypt(payload, 'Enter the backup password'); return }
+        ;(card.querySelector('#v-dec') as HTMLButtonElement).disabled = true
+        let secret: string
+        try { secret = await decryptBackup(payload, pw.value) } catch { renderDecrypt(payload, 'Wrong password for this backup'); return }
+        try { finish(await persistSecretBlob(secret, payload)) } catch (e) { renderDecrypt(payload, e instanceof Error ? e.message : 'Import failed') }
+      }
+      ;(card.querySelector('#v-back') as HTMLButtonElement).onclick = () => renderMain()
+    }
+
+    // ── Scan QR (camera, in-vault) ──
+    function renderScan(err?: string) {
+      card.classList.remove('v-center')
+      card.innerHTML = `
+        <div class="flex justify-end w-full"><button id="v-close" class="v-eye" style="position:static;transform:none">${ICON.x}</button></div>
+        <video id="v-video" class="w-full aspect-square rounded-xl border-2 border-primary bg-black object-cover" playsinline muted></video>
+        <p class="v-note text-center">Point your camera at the backup QR code</p>
+        ${err ? `<div class="v-warn v-warn-red"><span class="shrink-0">${ICON.alert}</span><span>${esc(err)}</span></div>` : ''}
+        <button id="v-cancel" class="v-btn w-full">Cancel</button>`
+      const video = card.querySelector('#v-video') as HTMLVideoElement
+      const back = () => { cleanup(); renderMain() }
+      ;(card.querySelector('#v-close') as HTMLButtonElement).onclick = back
+      ;(card.querySelector('#v-cancel') as HTMLButtonElement).onclick = back
+      stopScan = startScan(
+        video,
+        (text) => {
+          cleanup()
+          const payload = tryParseBackup(text)
+          if (payload) renderDecrypt(payload)
+          else renderMain("That QR code isn't a DEN backup")
+        },
+        (msg) => { stopScan = null; renderScan(msg) },
+      )
+    }
+
+    renderMain()
   })
 }
 
@@ -628,10 +741,22 @@ function showSecretReveal(secret: string, payload: BackupPayloadV1, label: strin
     <div class="v-title">${isMnemonic ? 'Recovery phrase' : 'Private key (nsec)'}</div>
     <div class="v-note">Keep this secret — anyone who has it controls this account.</div>
     ${revealBlock(inner)}
-    <button id="v-dl" class="v-btn">Download encrypted backup</button>
-    <button id="v-ok" class="v-btn-primary">Done</button>`
+    <div id="v-qr" class="hidden w-full flex justify-center"><img id="v-qrimg" alt="Encrypted backup QR" class="rounded-xl bg-white p-2" width="240" height="240" /></div>
+    <div class="v-row">
+      <button id="v-dl" class="v-btn v-grow">${ICON.download} Download</button>
+      <button id="v-showqr" class="v-btn v-grow">${ICON.qr} Show QR</button>
+    </div>
+    <button id="v-ok" class="v-btn-primary w-full">Done</button>`
   wireReveal(card)
   ;(card.querySelector('#v-dl') as HTMLButtonElement).onclick = () => downloadBackup(payload, label)
+  const qrWrap = card.querySelector('#v-qr') as HTMLDivElement
+  const qrImg = card.querySelector('#v-qrimg') as HTMLImageElement
+  const showQrBtn = card.querySelector('#v-showqr') as HTMLButtonElement
+  showQrBtn.onclick = async () => {
+    if (!qrWrap.classList.contains('hidden')) { qrWrap.classList.add('hidden'); showQrBtn.innerHTML = `${ICON.qr} Show QR`; return }
+    try { qrImg.src = await qrDataUrl(JSON.stringify(payload)); qrWrap.classList.remove('hidden'); showQrBtn.innerHTML = `${ICON.qr} Hide QR` }
+    catch { /* payload too large for a QR — ignore */ }
+  }
   return new Promise<void>((resolve) => {
     ;(card.querySelector('#v-ok') as HTMLButtonElement).onclick = () => { close(); resolve() }
   })
