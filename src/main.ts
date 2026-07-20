@@ -384,6 +384,7 @@ const ICON = {
   x: I('<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>', 18),
   hash: I('<line x1="4" y1="9" x2="20" y2="9"/><line x1="4" y1="15" x2="20" y2="15"/><line x1="10" y1="3" x2="8" y2="21"/><line x1="16" y1="3" x2="14" y2="21"/>', 16),
   keyboard: I('<rect x="2" y="4" width="20" height="16" rx="2"/><path d="M6 8h.01M10 8h.01M14 8h.01M18 8h.01M8 12h.01M12 12h.01M16 12h.01M7 16h10"/>', 16),
+  chevron: I('<polyline points="6 9 12 15 18 9"/>', 16),
 }
 
 /** Encode text as a QR data-URL (black-on-white so any scanner reads it). */
@@ -454,7 +455,7 @@ function showGenerateReveal(mnemonic: string): Promise<{ pubkey: string; seedId:
   card.classList.add('v-center')
   const words = mnemonic.split(' ')
   let pin = '', name = '', hint = ''
-  let revealed = false, downloaded = false, verified = false
+  let revealed = false, downloaded = false, verified = false, accordionOpen = false
 
   return new Promise<{ pubkey: string; seedId: string }>((resolve, reject) => {
     // ── Step 1: Create Account (set the PIN) ──
@@ -487,10 +488,19 @@ function showGenerateReveal(mnemonic: string): Promise<{ pubkey: string; seedId:
       card.innerHTML = `
         <div class="v-icon-row"><span class="text-primary">${ICON.shield}</span><h2 class="v-h2">Backup Seed Phrase</h2></div>
         <div class="v-warn v-warn-red"><span class="shrink-0 mt-0.5">${ICON.alert}</span><span>Write down these words and store them securely. Anyone with these words can access your keys and funds.</span></div>
-        <div class="v-wordgrid">${grid}</div>
-        <div class="flex gap-2 w-full">
-          <button id="v-reveal" class="v-pill flex-1">${revealed ? ICON.eyeOff + ' Censor' : ICON.eye + ' Reveal'}</button>
-          <button id="v-copy" class="v-pill flex-1">${ICON.copy} Copy</button>
+        <div class="w-full rounded-lg border border-border overflow-hidden">
+          <button id="v-acc" class="w-full flex items-center justify-between px-3 py-2.5 bg-secondary/30 hover:bg-secondary/60 cursor-pointer border-0 text-left transition-colors">
+            <span class="flex items-center gap-2 text-sm font-medium text-foreground">${ICON.lock} View recovery phrase</span>
+            <span class="text-muted-foreground" style="display:inline-flex;transition:transform .2s;transform:rotate(${accordionOpen ? '180deg' : '0deg'})">${ICON.chevron}</span>
+          </button>
+          ${accordionOpen ? `
+            <div class="p-3 border-t border-border" style="display:flex;flex-direction:column;gap:12px">
+              <div class="v-wordgrid">${grid}</div>
+              <div class="flex gap-2 w-full">
+                <button id="v-reveal" class="v-pill flex-1">${revealed ? ICON.eyeOff + ' Censor' : ICON.eye + ' Reveal'}</button>
+                <button id="v-copy" class="v-pill flex-1">${ICON.copy} Copy</button>
+              </div>
+            </div>` : ''}
         </div>
         ${dlOpen ? `
           <div class="v-sub">
@@ -508,11 +518,17 @@ function showGenerateReveal(mnemonic: string): Promise<{ pubkey: string; seedId:
         <div id="v-verr" class="v-err"></div>
         <button id="v-cont" class="v-btn-primary w-full" ${(!downloaded || !verified) ? 'disabled' : ''}>${!downloaded ? 'Download backup to continue' : !verified ? 'Verify your backup to continue' : "I've Saved My Seed · Continue"}</button>`
       const verr = card.querySelector('#v-verr') as HTMLDivElement
-      ;(card.querySelector('#v-reveal') as HTMLButtonElement).onclick = () => {
+      ;(card.querySelector('#v-acc') as HTMLButtonElement).onclick = () => {
+        accordionOpen = !accordionOpen
+        if (!accordionOpen) revealed = false // re-censor when collapsing
+        renderBackup(dlOpen)
+      }
+      const revealBtn = card.querySelector('#v-reveal') as HTMLButtonElement | null
+      if (revealBtn) revealBtn.onclick = () => {
         if (revealed) { revealed = false; renderBackup(dlOpen) } else renderRevealConfirm(dlOpen)
       }
-      const copyBtn = card.querySelector('#v-copy') as HTMLButtonElement
-      copyBtn.onclick = async () => {
+      const copyBtn = card.querySelector('#v-copy') as HTMLButtonElement | null
+      if (copyBtn) copyBtn.onclick = async () => {
         try { await navigator.clipboard.writeText(mnemonic); copyBtn.innerHTML = `${ICON.check} Copied!`; setTimeout(() => { copyBtn.innerHTML = `${ICON.copy} Copy` }, 1500) } catch { /* clipboard blocked */ }
       }
       if (dlOpen) {
@@ -1064,7 +1080,15 @@ const ops: Record<string, (p?: any) => Promise<unknown>> = {
       }
       sign = (privHex) => {
         const args = [privHex, utxos, tx.recipientAddress as string, amountSats, Number(tx.feeRate)] as const
-        return tx.addressType === 'segwit' ? createSegwitTransaction(...args) : createTaprootTransaction(...args)
+        // Both P2WPKH variants ('segwit' = 02‖x, 'segwit-odd' = 03‖x) share one signer —
+        // it picks the key parity that controls `fromAddress` and throws if neither does.
+        const isP2wpkh = tx.addressType === 'segwit' || tx.addressType === 'segwit-odd'
+        if (isP2wpkh) {
+          const from = tx.fromAddress as string | undefined
+          if (!from) throw new Error('Missing fromAddress — cannot determine which key controls these funds.')
+          return createSegwitTransaction(...args, from)
+        }
+        return createTaprootTransaction(...args)
       }
     } else {
       const data = tx.data as Uint8Array | undefined

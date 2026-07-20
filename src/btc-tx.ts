@@ -423,9 +423,33 @@ export function createSegwitTransaction(
   recipientAddress: string,
   amountSats: bigint,
   feeRate: number,
+  /**
+   * The P2WPKH address the UTXOs belong to. REQUIRED — one x-only key yields TWO
+   * valid P2WPKH addresses, 02‖x (even-y) and 03‖x (odd-y), controlled by `d` and
+   * `n - d` respectively. We select the key by matching against this address rather
+   * than assuming natural parity, which silently produced unspendable transactions
+   * (and sent change to the wrong address) for the other parity. Mandatory so the
+   * compiler prevents any caller from reintroducing the natural-parity assumption.
+   */
+  fromAddress: string,
 ): string {
   const privKeyBytes = hexToBytes(privateKeyHex)
-  const compressedPubkey = getPublicKey(privKeyBytes, true) // 33 bytes, natural parity
+  const expectedScript = decodeBech32Address(fromAddress)
+  // Negating the scalar flips the pubkey's y-parity while keeping x identical.
+  const negatedKey = etc.numberToBytesBE(CURVE_ORDER - etc.bytesToNumberBE(privKeyBytes))
+  const candidates: Array<[Uint8Array, Uint8Array]> = [
+    [privKeyBytes, getPublicKey(privKeyBytes, true)],
+    [negatedKey, getPublicKey(negatedKey, true)],
+  ]
+  const match = candidates.find(([, pub]) => {
+    const script = p2wpkhScriptPubKey(hash160(pub))
+    return script.length === expectedScript.length && script.every((b, i) => b === expectedScript[i])
+  })
+  // Fail closed: never sign with a key that doesn't control the funded address.
+  if (!match) {
+    throw new Error(`This key does not control ${fromAddress} — refusing to sign.`)
+  }
+  const [signingKey, compressedPubkey] = match
 
   // HASH160 of compressed pubkey for P2WPKH
   const pubkeyHash = hash160(compressedPubkey)
@@ -467,7 +491,7 @@ export function createSegwitTransaction(
   for (let i = 0; i < utxos.length; i++) {
     const sighash = segwitSighash(2, 0, sighashInputs, outputs, i, scriptCode)
     // ECDSA sign (prehash: false since we already hashed)
-    const sigBytes = secp256k1Sign(sighash, privKeyBytes, {
+    const sigBytes = secp256k1Sign(sighash, signingKey, {
       prehash: false,
       lowS: true,
       format: 'compact', // 64 bytes: r(32) + s(32)
