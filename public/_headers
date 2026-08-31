@@ -1,0 +1,13 @@
+# HTTP response headers for the vault origin (Cloudflare Pages / Netlify honor this file; Vite copies
+# public/ into dist/). This exists because `frame-ancestors` (and X-Frame-Options) are IGNORED when a CSP
+# is delivered via an <meta> tag — they only take effect as a real HTTP header. The <meta> CSP in
+# index.html covers the rest; this header is what actually stops other origins from framing the vault
+# (clickjacking the PIN / seed-reveal overlays).
+#
+# IMPORTANT: `frame-ancestors` MUST list your app origin(s) — the same value(s) as ALLOWED_PARENT_ORIGINS
+# in src/main.ts — or the app's iframe embed will be blocked. Update both together.
+# NOTE: GitHub Pages does NOT support custom headers, so on GitHub Pages this file is ignored and there is
+# no effective anti-framing control — host the vault on Cloudflare Pages / Netlify / Vercel (or any host
+# that can set response headers) if you rely on it.
+/*
+  Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src 'self' blob:; connect-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors https://web.denchat.top

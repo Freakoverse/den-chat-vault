@@ -26,6 +26,7 @@ import { bytesToHex, hexToBytes } from '@noble/hashes/utils'
 import { getPublicKey, finalizeEvent, nip04, nip44, nip19, type EventTemplate } from 'nostr-tools'
 import { createTaprootTransaction, createSegwitTransaction, type UTXO } from './btc-tx'
 import { signEvmTransaction, getEvmSigningKey, type EvmChain } from './evm-tx'
+import { deriveSubKey } from './skd'
 
 /* ─── Config (EDIT BEFORE DEPLOY) ─── */
 const ALLOWED_PARENT_ORIGINS = ['https://web.denchat.top']
@@ -113,6 +114,14 @@ async function kvSet(k: string, v: unknown): Promise<void> {
     tx.onerror = () => rej(tx.error)
   })
 }
+async function kvDel(k: string): Promise<void> {
+  const db = await idb()
+  return new Promise((res, rej) => {
+    const tx = db.transaction(STORE, 'readwrite').objectStore(STORE).delete(k)
+    tx.onsuccess = () => res()
+    tx.onerror = () => rej(tx.error)
+  })
+}
 
 /* ─── Seeds + accounts (one PIN per seed; accounts are HD-derived from it) ─── */
 // A "seed" is a PIN-encrypted secret: a BIP-39 mnemonic (kind 'seed') or a single
@@ -123,21 +132,59 @@ interface AccountMeta { pubkey: string; npub: string; seedId: string; index: num
 const seedBlobKey = (id: string) => `seedblob:${id}`
 const now = () => Math.floor(Date.now() / 1000)
 
+// A single global mutation chain serializes every read-modify-write of the shared `seeds`/`accts`
+// arrays. The message handler runs ops concurrently, so without this two ops that both read the
+// old array and then write (e.g. a rename racing a derive) would clobber each other's change —
+// silent account/seed loss. `mutateSeeds`/`mutateAccounts` read-modify-write inside the chain so
+// each mutation sees the previous one's result. Errors are swallowed for the NEXT waiter so the
+// chain can't deadlock. (Cross-tab writes still race — a second vault iframe is a separate JS
+// context — but that's a much rarer, documented residual, not the single-tab concurrency here.)
+let mutationChain: Promise<unknown> = Promise.resolve()
+function withMutation<T>(fn: () => Promise<T>): Promise<T> {
+  const run = mutationChain.then(fn, fn)
+  mutationChain = run.catch(() => {})
+  return run
+}
 async function getSeeds(): Promise<SeedMeta[]> { return (await kvGet<SeedMeta[]>('seeds')) || [] }
 async function setSeeds(list: SeedMeta[]) { await kvSet('seeds', list) }
+function mutateSeeds<T>(fn: (list: SeedMeta[]) => { next: SeedMeta[]; result?: T }): Promise<T | undefined> {
+  return withMutation(async () => { const { next, result } = fn(await getSeeds()); await setSeeds(next); return result })
+}
 async function upsertSeed(meta: SeedMeta) {
-  const list = await getSeeds()
-  const i = list.findIndex((s) => s.id === meta.id)
-  if (i >= 0) list[i] = { ...list[i], ...meta }; else list.push(meta)
-  await setSeeds(list)
+  await mutateSeeds((list) => {
+    const i = list.findIndex((s) => s.id === meta.id)
+    if (i >= 0) list[i] = { ...list[i], ...meta }; else list.push(meta)
+    return { next: list }
+  })
 }
 async function getAccounts(): Promise<AccountMeta[]> { return (await kvGet<AccountMeta[]>('accts')) || [] }
 async function setAccounts(list: AccountMeta[]) { await kvSet('accts', list) }
+function mutateAccounts<T>(fn: (list: AccountMeta[]) => { next: AccountMeta[]; result?: T }): Promise<T | undefined> {
+  return withMutation(async () => { const { next, result } = fn(await getAccounts()); await setAccounts(next); return result })
+}
 async function upsertAccount(meta: AccountMeta) {
-  const list = await getAccounts()
-  const i = list.findIndex((a) => a.pubkey === meta.pubkey)
-  if (i >= 0) list[i] = { ...list[i], ...meta }; else list.push(meta)
-  await setAccounts(list)
+  await mutateAccounts((list) => {
+    const i = list.findIndex((a) => a.pubkey === meta.pubkey)
+    if (i >= 0) list[i] = { ...list[i], ...meta }; else list.push(meta)
+    return { next: list }
+  })
+}
+// Remove an account (and its seed's blob/meta/rate state if it was the seed's last account) as one
+// atomic read-modify-write, so a concurrent derive/rename can't clobber the removal or vice-versa.
+async function removeAccountAtomic(pubkey: string, seedId: string): Promise<void> {
+  await withMutation(async () => {
+    const remaining = (await getAccounts()).filter((a) => a.pubkey !== pubkey)
+    await setAccounts(remaining)
+    if (!remaining.some((a) => a.seedId === seedId)) {
+      await kvDel(seedBlobKey(seedId))
+      await setSeeds((await getSeeds()).filter((s) => s.id !== seedId))
+      await rateReset(seedId)
+    }
+  })
+  // Removing the active account: drop the in-memory session AND the persisted `active` pointer, else
+  // `status` keeps reporting `active` = a pubkey no longer present in `accounts` after a reload.
+  if (activePub === pubkey) lock()
+  if ((await kvGet<string>('active')) === pubkey) await kvDel('active')
 }
 function getSeedBlob(id: string) { return kvGet<BackupPayloadV1>(seedBlobKey(id)) }
 
@@ -155,6 +202,7 @@ function touchSession() {
   idleTimer = setTimeout(lock, SESSION_IDLE_MS)
 }
 function unlockSession(privHex: string) {
+  if (sessionPriv) sessionPriv.fill(0) // zero the previous account's key before switching (don't leave it on the heap)
   sessionPriv = hexToBytes(privHex)
   activePub = getPublicKey(sessionPriv)
   void kvSet('active', activePub)
@@ -182,6 +230,20 @@ async function rateFail(id: string): Promise<void> {
 }
 async function rateReset(id: string): Promise<void> { await kvSet(rateKey(id), { fails: 0, lockedUntil: 0 }) }
 
+/* Per-seed serialization. The rate-limiter's guard→decrypt→fail sequence is a read-modify-write of the
+ * persisted fail counter with a slow PBKDF2 decrypt in the middle. Without serialization a compromised
+ * app could fire many `unlock` calls in parallel: they all pass `rateGuard` against the same pre-fail
+ * snapshot and their `rateFail` writes race, so the escalating lockout barely advances. `withSeedLock`
+ * runs the whole sequence one-at-a-time per seed id. The chain always advances (errors swallowed for the
+ * NEXT waiter), so it cannot deadlock. */
+const seedLocks = new Map<string, Promise<unknown>>()
+function withSeedLock<T>(id: string, fn: () => Promise<T>): Promise<T> {
+  const prev = seedLocks.get(id) ?? Promise.resolve()
+  const run = prev.then(fn, fn) // run after the previous op regardless of its outcome
+  seedLocks.set(id, run.catch(() => {})) // keep the chain alive; a rejection must not block the next waiter
+  return run
+}
+
 /* ─── In-vault transaction confirmation (rendered in the isolated overlay) ─── */
 // Ask the parent to make this iframe a full-screen overlay (or hide it again).
 function showTxOverlay(show: boolean) {
@@ -190,7 +252,7 @@ function showTxOverlay(show: boolean) {
 }
 
 function esc(s: string): string {
-  return s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c] as string))
+  return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string))
 }
 
 /** Format an integer `value` with `decimals` places, trimming trailing zeros. */
@@ -263,15 +325,27 @@ function wireReveal(card: HTMLElement): void {
 }
 
 /** Open the dimmed-backdrop overlay and return the (empty) card to fill + a close fn. */
+// Refcount concurrent overlays: only ask the parent to ENLARGE on the first open and to SHRINK on
+// the last close. Without the refcount, if two interactive ops overlap, the first to close would
+// post {show:false} and hide the iframe while the second overlay is still mounted — its PIN prompt
+// becomes invisible/unclickable and its promise (and the app's awaiting call) hangs forever.
+let openOverlayCount = 0
 function openOverlay(): { card: HTMLDivElement; close: () => void } {
-  showTxOverlay(true)
+  if (openOverlayCount === 0) showTxOverlay(true)
+  openOverlayCount++
   const backdrop = document.createElement('div')
   backdrop.className = 'v-backdrop'
   const card = document.createElement('div')
   card.className = 'v-card'
   backdrop.appendChild(card)
   document.body.appendChild(backdrop)
-  return { card, close: () => { backdrop.remove(); showTxOverlay(false) } }
+  let closed = false
+  return { card, close: () => {
+    if (closed) return
+    closed = true
+    backdrop.remove()
+    if (--openOverlayCount <= 0) { openOverlayCount = 0; showTxOverlay(false) }
+  } }
 }
 
 /**
@@ -344,6 +418,7 @@ function confirmAndSign(acct: AccountMeta, d: TxDisplay, sign: (privHex: string)
 
 /** Encrypt + store a generated mnemonic as a new seed + its index-0 account, then unlock. */
 async function persistGeneratedSeed(mnemonic: string, pin: string, name?: string, hint?: string): Promise<{ pubkey: string; seedId: string }> {
+  if (pin.length < 4) throw new Error('PIN must be at least 4 characters') // enforce the floor at the storage layer, not just the UI
   if (!validateMnemonic(mnemonic, wordlist)) throw new Error('Invalid mnemonic')
   const { privHex, pubHex } = deriveKeypair(mnemonic, 0)
   const seedId = pubHex
@@ -529,7 +604,15 @@ function showGenerateReveal(mnemonic: string): Promise<{ pubkey: string; seedId:
       }
       const copyBtn = card.querySelector('#v-copy') as HTMLButtonElement | null
       if (copyBtn) copyBtn.onclick = async () => {
-        try { await navigator.clipboard.writeText(mnemonic); copyBtn.innerHTML = `${ICON.check} Copied!`; setTimeout(() => { copyBtn.innerHTML = `${ICON.copy} Copy` }, 1500) } catch { /* clipboard blocked */ }
+        try {
+          await navigator.clipboard.writeText(mnemonic)
+          copyBtn.innerHTML = `${ICON.check} Copied!`; setTimeout(() => { copyBtn.innerHTML = `${ICON.copy} Copy` }, 1500)
+          // Auto-clear the seed from the shared clipboard after 45s — but only if it's still there, so we
+          // don't clobber something the user copied since. readText may be blocked → then just skip.
+          setTimeout(async () => {
+            try { if ((await navigator.clipboard.readText()) === mnemonic) await navigator.clipboard.writeText('') } catch { /* read/write blocked */ }
+          }, 45_000)
+        } catch { /* clipboard blocked */ }
       }
       if (dlOpen) {
         const dlpin = wirePinField(card, 'v-dlpin')
@@ -823,9 +906,7 @@ function showChangePin(seedId: string): Promise<{ ok: boolean }> {
         catch { await rateFail(seedId); throw new Error('Incorrect current PIN') }
         await rateReset(seedId)
         await kvSet(seedBlobKey(seedId), await encryptBackup(secret, nw.value))
-        const seeds = await getSeeds()
-        const s = seeds.find((x) => x.id === seedId)
-        if (s) { s.hint = hintEl.value.trim() || null; await setSeeds(seeds) }
+        await mutateSeeds((list) => { const s = list.find((x) => x.id === seedId); if (s) s.hint = hintEl.value.trim() || null; return { next: list } })
         close(); resolve({ ok: true })
       } catch (e) {
         errEl.textContent = e instanceof Error ? e.message : 'Failed'; okBtn.disabled = false
@@ -838,7 +919,10 @@ function showChangePin(seedId: string): Promise<{ ok: boolean }> {
 /* ─── Operations ─── */
 const ops: Record<string, (p?: any) => Promise<unknown>> = {
   async status() {
-    return { seeds: await getSeeds(), accounts: await getAccounts(), active: (await kvGet<string>('active')) || null, unlocked: !!sessionPriv, pubkey: activePub }
+    // Strip `hint` before it crosses to the app origin — users often encode the PIN itself in the
+    // hint, and it's only ever needed inside the vault's own overlays (which read getSeeds directly).
+    const seeds = (await getSeeds()).map(({ hint: _hint, ...s }) => s)
+    return { seeds, accounts: await getAccounts(), active: (await kvGet<string>('active')) || null, unlocked: !!sessionPriv, pubkey: activePub }
   },
   async listAccounts() { return getAccounts() },
   // Generate a fresh identity. Returns the mnemonic ONCE so the app can show the
@@ -913,15 +997,18 @@ const ops: Record<string, (p?: any) => Promise<unknown>> = {
   async unlock({ pubkey, pin }: { pubkey: string; pin: string }) {
     const acct = (await getAccounts()).find((a) => a.pubkey === pubkey)
     if (!acct) throw new Error('No such account')
-    await rateGuard(acct.seedId)
-    const blob = await getSeedBlob(acct.seedId)
-    if (!blob) throw new Error('No such account')
-    let secret: string
-    try { secret = await decryptBackup(blob, pin) }
-    catch { await rateFail(acct.seedId); throw new Error('Incorrect PIN') }
-    await rateReset(acct.seedId)
-    unlockSession(keypairFromSecret(secret, acct.index).privHex)
-    return { pubkey: activePub }
+    // Serialize per seed so parallel app-driven attempts can't race the rate-limiter (see withSeedLock).
+    return withSeedLock(acct.seedId, async () => {
+      await rateGuard(acct.seedId)
+      const blob = await getSeedBlob(acct.seedId)
+      if (!blob) throw new Error('No such account')
+      let secret: string
+      try { secret = await decryptBackup(blob, pin) }
+      catch { await rateFail(acct.seedId); throw new Error('Incorrect PIN') }
+      await rateReset(acct.seedId)
+      unlockSession(keypairFromSecret(secret, acct.index).privHex)
+      return { pubkey: activePub }
+    })
   },
   // Like unlock(), but the PIN is collected in the vault's own overlay — the app never
   // sees it. The app calls this and waits; the vault prompts, verifies, and unlocks.
@@ -944,6 +1031,26 @@ const ops: Record<string, (p?: any) => Promise<unknown>> = {
       },
     )
   },
+  // Confirm the account's PIN in the vault overlay (the app never sees it), WITHOUT unlocking the session —
+  // a "confirm your PIN" gate (e.g. delete-account). Same overlay UI as unlockInteractive, so it's the app
+  // that replaces the old app-side PIN box + exportBackup-as-oracle (which put the PIN in the app origin).
+  async verifyPinInteractive({ pubkey }: { pubkey: string }) {
+    const acct = (await getAccounts()).find((a) => a.pubkey === pubkey)
+    if (!acct) throw new Error('No such account')
+    const seed = (await getSeeds()).find((s) => s.id === acct.seedId)
+    return promptPinAction(
+      { title: 'Confirm your PIN', eyebrow: 'DEN Chat Vault · Confirm', subtitle: seed?.hint ? `Hint: ${seed.hint}` : 'Enter your PIN to confirm.', confirmLabel: 'Confirm' },
+      async (pin) => {
+        await rateGuard(acct.seedId)
+        const blob = await getSeedBlob(acct.seedId)
+        if (!blob) throw new Error('No such account')
+        try { await decryptBackup(blob, pin) }
+        catch { await rateFail(acct.seedId); throw new Error('Incorrect PIN') }
+        await rateReset(acct.seedId)
+        return { ok: true }
+      },
+    )
+  },
   async lock() { lock(); return { ok: true } },
   async removeAccount({ pubkey, pin }: { pubkey: string; pin: string }) {
     const accounts = await getAccounts()
@@ -951,15 +1058,7 @@ const ops: Record<string, (p?: any) => Promise<unknown>> = {
     if (!acct) return { ok: true }
     const blob = await getSeedBlob(acct.seedId)
     if (blob) { try { await decryptBackup(blob, pin) } catch { await rateFail(acct.seedId); throw new Error('Incorrect PIN') } }
-    const remaining = accounts.filter((a) => a.pubkey !== pubkey)
-    await setAccounts(remaining)
-    // If that was the seed's last account, drop the seed blob + meta + rate state too.
-    if (!remaining.some((a) => a.seedId === acct.seedId)) {
-      await kvSet(seedBlobKey(acct.seedId), undefined)
-      await setSeeds((await getSeeds()).filter((s) => s.id !== acct.seedId))
-      await rateReset(acct.seedId)
-    }
-    if (activePub === pubkey) lock()
+    await removeAccountAtomic(pubkey, acct.seedId)
     return { ok: true }
   },
   // Remove an account — PIN confirmed in the vault overlay.
@@ -972,14 +1071,7 @@ const ops: Record<string, (p?: any) => Promise<unknown>> = {
       async (pin) => {
         const blob = await getSeedBlob(acct.seedId)
         if (blob) { try { await decryptBackup(blob, pin) } catch { await rateFail(acct.seedId); throw new Error('Incorrect PIN') } }
-        const remaining = accounts.filter((a) => a.pubkey !== pubkey)
-        await setAccounts(remaining)
-        if (!remaining.some((a) => a.seedId === acct.seedId)) {
-          await kvSet(seedBlobKey(acct.seedId), undefined)
-          await setSeeds((await getSeeds()).filter((s) => s.id !== acct.seedId))
-          await rateReset(acct.seedId)
-        }
-        if (activePub === pubkey) lock()
+        await removeAccountAtomic(pubkey, acct.seedId)
         return { ok: true }
       },
     )
@@ -1018,19 +1110,16 @@ const ops: Record<string, (p?: any) => Promise<unknown>> = {
     return { ok: true }
   },
   async renameSeed({ seedId, name }: { seedId: string; name: string }) {
-    const seeds = await getSeeds()
-    const s = seeds.find((x) => x.id === seedId)
-    if (s) { s.name = name; await setSeeds(seeds) }
+    await mutateSeeds((list) => { const s = list.find((x) => x.id === seedId); if (s) s.name = name; return { next: list } })
     return { ok: true }
   },
   async renameAccount({ pubkey, name }: { pubkey: string; name: string }) {
-    const accounts = await getAccounts()
-    const a = accounts.find((x) => x.pubkey === pubkey)
-    if (a) { a.name = name; await setAccounts(accounts) }
+    await mutateAccounts((list) => { const a = list.find((x) => x.pubkey === pubkey); if (a) a.name = name; return { next: list } })
     return { ok: true }
   },
   // Change a seed's PIN (re-encrypt its blob). PIN is per-seed, so this covers all its accounts.
   async changePin({ pubkey, currentPin, newPin, newHint }: { pubkey: string; currentPin: string; newPin: string; newHint?: string }) {
+    if (newPin.length < 4) throw new Error('New PIN must be at least 4 characters') // enforce the floor here, not just in the overlay UI
     const acct = (await getAccounts()).find((a) => a.pubkey === pubkey)
     if (!acct) throw new Error('No such account')
     await rateGuard(acct.seedId)
@@ -1042,9 +1131,7 @@ const ops: Record<string, (p?: any) => Promise<unknown>> = {
     await rateReset(acct.seedId)
     await kvSet(seedBlobKey(acct.seedId), await encryptBackup(secret, newPin))
     if (newHint !== undefined) {
-      const seeds = await getSeeds()
-      const s = seeds.find((x) => x.id === acct.seedId)
-      if (s) { s.hint = newHint || null; await setSeeds(seeds) }
+      await mutateSeeds((list) => { const s = list.find((x) => x.id === acct.seedId); if (s) s.hint = newHint || null; return { next: list } })
     }
     return { ok: true }
   },
@@ -1062,7 +1149,7 @@ const ops: Record<string, (p?: any) => Promise<unknown>> = {
   },
   // Build + sign a blockchain transaction from STRUCTURED params (the vault derives the
   // sighash itself, so the in-vault confirm can't be forged). Returns the signed raw hex.
-  // NOTE: PIN-confirm gating is added in the next stage; for now this signs with the session key.
+  // Signing is PIN-gated in the vault overlay via confirmAndSign.
   async signTransaction({ chain, tx }: { chain: string; tx: any }) {
     if (!activePub) throw new Error('Locked')
     const acct = (await getAccounts()).find((a) => a.pubkey === activePub)
@@ -1092,10 +1179,42 @@ const ops: Record<string, (p?: any) => Promise<unknown>> = {
       }
     } else {
       const data = tx.data as Uint8Array | undefined
+      const hasCalldata = !!data && data.length > 0
       const erc20 = data ? decodeErc20(data) : null
-      display = erc20
-        ? { title: `Send token (${chain})`, rows: [['Amount (raw)', erc20.amount.toString()], ['To', erc20.to], ['Token contract', tx.to as string]] }
-        : { title: `Send on ${chain}`, rows: [['Amount', `${formatUnits(BigInt(tx.value), 18)} (native)`], ['To', tx.to as string]] }
+      const nativeValue = BigInt(tx.value)
+      if (erc20) {
+        // A legitimate ERC-20 transfer carries ZERO native value. But `value` is signed regardless
+        // (see the signer below), so a hidden non-zero `value` would move native coin to `tx.to`
+        // while the confirm shows only a token transfer — a forged-confirm native-coin drain. Always
+        // show the native value, and flag it hard when non-zero so it can't be smuggled past the user.
+        const rows: Array<[string, string]> = [['Amount (raw)', erc20.amount.toString()], ['To', erc20.to], ['Token contract', tx.to as string]]
+        rows.push(nativeValue === 0n
+          ? ['Value', '0 (native)']
+          : ['⚠ Native value', `${formatUnits(nativeValue, 18)} (native) — this ALSO sends native coin!`])
+        display = { title: `Send token (${chain})`, rows }
+      } else if (hasCalldata) {
+        // Unrecognized contract calldata. The vault can only decode ERC-20 transfer; for anything else it
+        // cannot prove what the call does. Showing a plain "native send" here HID the calldata while still
+        // signing it — a confused-deputy (the confirm read as a harmless transfer while signing e.g. an
+        // unlimited `approve`). Display it HONESTLY instead: mark it an unverified contract call and show
+        // the target, value, function selector, and calldata size, so the signature can't misrepresent it.
+        const selector = '0x' + bytesToHex(data!.slice(0, 4))
+        display = {
+          title: `Contract call (${chain})`,
+          rows: [
+            ['⚠ Unverified call', 'the vault can’t decode this — approve only if you trust the app'],
+            ['Contract', tx.to as string],
+            ['Value', `${formatUnits(nativeValue, 18)} (native)`],
+            ['Function', selector],
+            ['Calldata', `${data!.length} bytes`],
+          ],
+        }
+      } else {
+        display = { title: `Send on ${chain}`, rows: [['Amount', `${formatUnits(nativeValue, 18)} (native)`], ['To', tx.to as string]] }
+      }
+      // Surface the fee ceiling (gasLimit × gasPrice). A hostile app can set an enormous gasPrice to
+      // burn the user's funds to miners while the amount/recipient look normal — show it so it's visible.
+      display.rows.push(['Network fee (max)', `${formatUnits(BigInt(tx.gasLimit) * BigInt(tx.gasPrice), 18)} (native)`])
       // getEvmSigningKey handles even-y negation for nostr-mode addresses.
       sign = (privHex) => signEvmTransaction(
         { chain: chain as EvmChain, to: tx.to, value: BigInt(tx.value), data, gasLimit: BigInt(tx.gasLimit), gasPrice: BigInt(tx.gasPrice), nonce: BigInt(tx.nonce) },
@@ -1122,15 +1241,57 @@ const ops: Record<string, (p?: any) => Promise<unknown>> = {
     const conv = nip44.v2.utils.getConversationKey(sessionPriv, pubkey)
     return nip44.v2.decrypt(ciphertext, conv)
   },
+
+  // ── NIP-SKD sub-key operations (NIP-CHAT v2 hubs) ──
+  // Derive an application-scoped sub-key from the identity key and act AS it — sign / nip44 — without the
+  // sub-key private material ever leaving the vault. These back the client's SkdSigner surface so a vault
+  // user can create and chat in v2 hubs (pseudonyms O/P/Pf + the sealed-join throwaway key). The derivation
+  // is byte-for-byte identical to the client reference (see src/skd.ts), so members derive matching
+  // pseudonyms. Like signEvent, chat signing is NOT confirm-gated — per-message prompts would be unusable.
+  async skdGetSubkeyPubkey({ context, peerPub }: { context: string; peerPub?: string }) {
+    if (!sessionPriv) throw new Error('Locked'); touchSession()
+    return deriveSubKey(sessionPriv, context, peerPub).pubHex
+  },
+  async skdSignAsSubkey({ context, event, peerPub }: { context: string; event: EventTemplate; peerPub?: string }) {
+    if (!sessionPriv) throw new Error('Locked'); touchSession()
+    const sub = deriveSubKey(sessionPriv, context, peerPub)
+    // finalizeEvent recomputes pubkey + id + sig from the sub-key private key.
+    return finalizeEvent(event, sub.privBytes)
+  },
+  async skdNip44EncryptAsSubkey({ context, recipientPub, plaintext, peerPub }: { context: string; recipientPub: string; plaintext: string; peerPub?: string }) {
+    if (!sessionPriv) throw new Error('Locked'); touchSession()
+    const sub = deriveSubKey(sessionPriv, context, peerPub)
+    const conv = nip44.v2.utils.getConversationKey(sub.privBytes, recipientPub)
+    return nip44.v2.encrypt(plaintext, conv)
+  },
+  async skdNip44DecryptAsSubkey({ context, senderPub, ciphertext, peerPub }: { context: string; senderPub: string; ciphertext: string; peerPub?: string }) {
+    if (!sessionPriv) throw new Error('Locked'); touchSession()
+    const sub = deriveSubKey(sessionPriv, context, peerPub)
+    const conv = nip44.v2.utils.getConversationKey(sub.privBytes, senderPub)
+    return nip44.v2.decrypt(ciphertext, conv)
+  },
 }
 
 /* ─── Message handler (origin-allowlisted) ─── */
+// M3 hardening — ops that take a plaintext seed/PIN over postMessage (or return the plaintext seed),
+// which would put the secret in the APP origin and defeat "an XSS in the app can never read the key". The
+// app must use their `*Interactive` overlay counterparts, where the secret is typed/shown INSIDE the vault
+// (verified: the app calls only the interactive variants). These stay callable by the top-level self-test
+// (direct function calls that bypass this handler), so they're rejected only on the app's postMessage path.
+// `exportBackup` returns the encrypted seed blob and used to double as an app-side PIN oracle (verifyPin);
+// the app now confirms PINs via `verifyPinInteractive` (overlay) instead, so the blob never needs to reach
+// the app — reveal/backup happens inside the overlay via `exportRevealInteractive`.
+const APP_DENIED_OPS = new Set(['generate', 'saveNew', 'importBackup', 'unlock', 'deriveAccount', 'removeAccount', 'changePin', 'exportBackup'])
+
 window.addEventListener('message', async (e: MessageEvent) => {
   if (!ALLOWED_PARENT_ORIGINS.includes(e.origin)) return // hard origin gate
   const msg = e.data
   if (!msg || typeof msg.id !== 'string' || typeof msg.type !== 'string') return
   const reply = (body: object) => (e.source as Window | null)?.postMessage({ id: msg.id, ...body }, e.origin)
-  const op = ops[msg.type]
+  if (APP_DENIED_OPS.has(msg.type)) return reply({ ok: false, error: `'${msg.type}' is not available to the app — use its interactive (overlay) variant so the secret never enters the app origin.` })
+  // own-property check: `ops[msg.type]` alone would resolve inherited Object.prototype methods
+  // (`toString`, `constructor`, …) and invoke them as ops. Only dispatch declared ops.
+  const op = Object.prototype.hasOwnProperty.call(ops, msg.type) ? ops[msg.type] : undefined
   if (!op) return reply({ ok: false, error: `Unknown op: ${msg.type}` })
   try { reply({ ok: true, result: await op(msg.params || {}) }) }
   catch (err) { reply({ ok: false, error: err instanceof Error ? err.message : String(err) }) }
@@ -1153,11 +1314,13 @@ async function runSelfTest() {
   if (!el) return
   const line = (html: string) => { el.innerHTML += html + '<br>' }
   line('<b>DEN Chat Vault — feasibility self-test</b><br><span class="muted">Confirms key gen, the encrypted-blob format, IndexedDB persistence, and signing all work in <i>this</i> context (open this page inside your installed PWA to test standalone iOS).</span><br>')
+  let throwawayPubkey: string | null = null // the self-test's temporary identity — removed in `finally` even on early failure
   try {
     line(`secure context: <span class="${window.isSecureContext ? 'ok' : 'fail'}">${window.isSecureContext}</span>`)
     const r = await ops.generate() as { mnemonic: string; pubkey: string }
     line('key generation: <span class="ok">ok</span>')
     await ops.saveNew({ mnemonic: r.mnemonic, pin: '123456', name: 'self-test' })
+    throwawayPubkey = r.pubkey
     line('encrypt + store (IndexedDB): <span class="ok">ok</span>')
     lock()
     const back = await getSeedBlob(r.pubkey)   // seedId === pubkey for the index-0 account
@@ -1177,12 +1340,24 @@ async function runSelfTest() {
     const btcOk = /^[0-9a-f]+$/.test(btcSigned) && btcSigned.length > 150
     line(`BTC taproot signing: <span class="${btcOk ? 'ok' : 'fail'}">${btcOk ? 'ok (valid tx built)' : 'FAIL'}</span>`)
 
-    // Cleanup the throwaway identity so the self-test leaves no key behind.
-    await ops.removeAccount({ pubkey: r.pubkey, pin: '123456' }); lock()
+    // ── NIP-SKD sub-key derivation (NIP-CHAT v2 pseudonyms) — verify against the NIP-SKD §8 reference
+    //    vectors. A MISMATCH means this build derives different pseudonyms than the DEN client, so a vault
+    //    user could not be found in a v2 hub's roster or decrypt its content. ──
+    const skdO = deriveSubKey(hexToBytes('11'.repeat(32)), 'nip-chat:v2:owner-pseudonym:abc-123').pubHex
+    const skdOok = skdO === '1a899ab5f78459554ba2aad008af3459597fd7906066a306f17d22415e2c59ee'
+    line(`NIP-SKD self (owner O): <span class="${skdOok ? 'ok' : 'fail'}">${skdOok ? 'ok (matches reference)' : 'MISMATCH — v2 pseudonyms differ from the client'}</span>`)
+    const skdP = deriveSubKey(hexToBytes('22'.repeat(32)), 'nip-chat:v2:member-pseudonym:abc-123', '1a899ab5f78459554ba2aad008af3459597fd7906066a306f17d22415e2c59ee').pubHex
+    const skdPok = skdP === 'be1eee04aba10e55fcf58ba2bd65a9c1c02c8abad9f2d607e7a511fde33cf251'
+    line(`NIP-SKD shared (member P): <span class="${skdPok ? 'ok' : 'fail'}">${skdPok ? 'ok (matches reference)' : 'MISMATCH — v2 pseudonyms differ from the client'}</span>`)
+
     line('<br><b class="ok">All checks passed — this origin can host the vault.</b>')
     line(`<span class="muted">pubkey: ${ev.pubkey}</span>`)
   } catch (err) {
     line(`<br><b class="fail">FAILED:</b> ${err instanceof Error ? err.message : String(err)}`)
     line('<span class="muted">If "read back from IndexedDB" failed in your installed PWA, this origin can\'t persist storage when embedded — pivot to the Worker + password-manager approach.</span>')
+  } finally {
+    // Always remove the throwaway identity so the self-test leaves no key behind — even if a check above threw.
+    if (throwawayPubkey) { try { await ops.removeAccount({ pubkey: throwawayPubkey, pin: '123456' }) } catch { /* best-effort */ } }
+    lock()
   }
 }

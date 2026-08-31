@@ -25,11 +25,19 @@ npm run build      # outputs ./dist
 2. Repo → Settings → Pages: set **custom domain = `vault.denchat.top`** (writes a `CNAME`; GitHub provisions HTTPS).
 3. DNS: add `CNAME  vault  →  <your-github-username>.github.io.`
 
-**Option B — Cloudflare Pages / Netlify / Vercel:**
+**Option B — Cloudflare Pages / Netlify / Vercel (recommended for the anti-framing header):**
 1. New project from this folder (build: `npm run build`, output `dist`).
 2. Set custom domain `vault.denchat.top`; add the `CNAME` the host gives you.
 
 HTTPS is mandatory (WebCrypto + secure-context). All hosts above provide it free on the custom domain.
+
+> **Anti-framing header:** the CSP `frame-ancestors` directive that stops other origins from iframing the
+> vault (and clickjacking the PIN / seed-reveal overlays) is **ignored in the `<meta>` tag** — browsers
+> only honor it as a real HTTP response header. `public/_headers` sets it for Cloudflare Pages / Netlify;
+> **GitHub Pages cannot set response headers**, so on Option A this protection is absent (the postMessage
+> origin allowlist still blocks ops from non-allowlisted framers, but the overlay UI isn't clickjacking-
+> protected). Prefer a header-capable host, and keep the `frame-ancestors` value in `public/_headers` in
+> sync with `ALLOWED_PARENT_ORIGINS` in `src/main.ts`.
 
 ## 4. Verify it works on your device (the important step)
 Open `https://vault.denchat.top/` **directly** (top-level) — on desktop, and then
@@ -45,7 +53,12 @@ This is the vault core: key gen, the encrypted at-rest blob (same format as the 
 backup file — PBKDF2-SHA256 600k → AES-256-GCM), IndexedDB storage, escalating
 rate-limited unlock, idle auto-lock, and the origin-allowlisted message protocol
 (`status`, `generate`, `saveNew`, `importBackup`, `unlock`, `lock`, `getPublicKey`,
-`signEvent`, `nip04/44Encrypt/Decrypt`, `exportBackup`).
+`signEvent`, `nip04/44Encrypt/Decrypt`, `exportBackup`, and the **NIP-SKD** sub-key
+ops for private v2 hubs — `skdGetSubkeyPubkey`, `skdSignAsSubkey`,
+`skdNip44Encrypt/DecryptAsSubkey` — which derive + act as the hub pseudonyms
+(`O`/`P`/`Pf`) without the sub-key private material leaving this origin; byte-for-byte
+identical to the app's reference derivation, checked against the NIP-SKD test vectors
+in the self-test).
 
 **Next phase (in the main app):** embed this iframe, a proxy signer that speaks the
 protocol, the onboarding UI (generate → re-upload-to-verify backup → save), import

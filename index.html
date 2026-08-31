@@ -7,7 +7,8 @@
     <!--
       Lock the vault down hard — it has no third-party code, makes no network
       requests, and is only ever embedded by the DEN app origin.
-      Tighten connect-src to 'none' once you've confirmed nothing here fetches.
+      NOTE: `frame-ancestors` below is IGNORED in a <meta> CSP (browsers only honor it as an HTTP
+      header). The anti-framing control is actually delivered via public/_headers — keep the two in sync.
     -->
     <meta http-equiv="Content-Security-Policy"
       content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src 'self' blob:; connect-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors https://web.denchat.top;" />
