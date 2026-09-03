@@ -1303,7 +1303,11 @@ if (window.parent !== window) {
   // can show the app behind it (looks like a native in-app modal, not a separate page).
   document.documentElement.style.background = 'transparent'
   document.body.style.background = 'transparent'
-  for (const origin of ALLOWED_PARENT_ORIGINS) window.parent.postMessage({ type: 'vault-ready' }, origin)
+  // Advertise what THIS build can do so the app can feature-gate correctly (an older vault omits this, and
+  // the app then keeps NIP-SKD / v2 hubs disabled instead of enabling ops this backend would reject).
+  // 'skd:1' == the sub-key ops below (skdGetSubkeyPubkey/skdSignAsSubkey/…) are present.
+  const capabilities = ['skd:1']
+  for (const origin of ALLOWED_PARENT_ORIGINS) window.parent.postMessage({ type: 'vault-ready', capabilities }, origin)
 }
 
 /* ─── Self-test (only when opened top-level, e.g. directly on your phone) ─── */
