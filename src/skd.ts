@@ -8,22 +8,25 @@
  *
  * This MUST be byte-for-byte identical to the DEN client's reference impl
  * (client `src/lib/crypto/skd.ts`, salt `"nip-skd-v1"`, 48-byte HKDF wide
- * reduction), verified against the NIP-SKD §8 test vectors — otherwise a vault
- * user derives mismatched pseudonyms and can neither be found in the roster nor
- * decrypt hub content. Two derivation forms:
+ * reduction, form-tagged info), verified against the NIP-SKD §8 test vectors —
+ * otherwise a vault user derives mismatched pseudonyms and can neither be found
+ * in the roster nor decrypt hub content. Three derivation forms, each with a
+ * form-tagged HKDF `info` = "nip-skd:" ‖ form ‖ 0x1F ‖ context (NIP-SKD §1):
  *
- *   - self   : HKDF( root_priv,               salt="nip-skd-v1", info=context )
- *   - shared : HKDF( ECDH_x(root_priv, peer), salt="nip-skd-v1", info=context )
+ *   - self    : HKDF( root_priv,               … ) → seed·G
+ *   - shared  : HKDF( ECDH_x(root_priv, peer),  … ) → seed·G
+ *   - blinded : HKDF( ECDH_x(root_priv, peer),  … ) → root_pub + seed·G   (peer verifies, can't sign)
  *
- * A 48-byte (384-bit) HKDF output is reduced mod n to a secp256k1 private key
- * (RFC 9380 §5 wide reduction → unbiased by construction); its x-only public key
- * is the sub-key identifier.
+ * A 48-byte (384-bit) HKDF output is reduced mod n (wide reduction, 0→1 pin);
+ * for self/shared it IS the sub-key private scalar, for blinded it is the tweak
+ * `t` added to the even-y-normalized root key. NIP-CHAT v2 uses `self` (O) and
+ * `blinded` (P/Pf/join); it does not use `shared`.
  */
 
 import { hmac } from '@noble/hashes/hmac'
 import { sha256 } from '@noble/hashes/sha256'
 import { bytesToHex, hexToBytes } from '@noble/hashes/utils'
-import { getSharedSecret, getPublicKey } from '@noble/secp256k1'
+import { getSharedSecret, getPublicKey, Point } from '@noble/secp256k1'
 
 /** NIP-SKD scheme salt (frozen). Family `skd`, version `1`. */
 const SKD_SALT = 'nip-skd-v1'
@@ -72,6 +75,24 @@ function seedToPrivKey(seed: Uint8Array): Uint8Array {
   return scalarToBytes(d)
 }
 
+/** NIP-SKD unit separator between the form tag and the context in the HKDF `info` (NIP-SKD §1). */
+const SKD_FORM_SEP = '\x1f'
+
+/** HKDF `info` = form-tagged context (NIP-SKD §1) — no two forms share a seed on the same inputs. */
+function skdInfo(form: 'self' | 'shared' | 'blinded', context: string): string {
+  return `nip-skd:${form}${SKD_FORM_SEP}${context}`
+}
+
+/** Reconstruct the even-`y` point from an x-only key (BIP-340) — the base for a blinded derivation. */
+function liftEvenY(xonlyHex: string) {
+  return Point.fromHex('02' + xonlyHex)
+}
+
+/** x-only (32-byte hex) of a curve point. */
+function pointToXonly(p: { x: bigint }): string {
+  return p.x.toString(16).padStart(64, '0')
+}
+
 /**
  * Raw ECDH x-coordinate (32 bytes) between a private key and a Nostr x-only pubkey.
  * The RAW x (same value NIP-44 feeds its KDF), NOT sha256(x) — NIP-SKD pins the raw x.
@@ -98,9 +119,42 @@ export interface SubKey {
  */
 export function deriveSubKey(rootPriv: Uint8Array, context: string, peerPubHex?: string): SubKey {
   if (!context) throw new Error('NIP-SKD: context must be non-empty')
+  const form = peerPubHex ? 'shared' : 'self'
   const ikm = peerPubHex ? ecdhX(rootPriv, peerPubHex) : rootPriv
-  const seed = hkdfWithSalt(ikm, SKD_SALT, context, 48)
+  const seed = hkdfWithSalt(ikm, SKD_SALT, skdInfo(form, context), 48)
   const privBytes = seedToPrivKey(seed)
   const pubHex = bytesToHex(getPublicKey(privBytes, true).slice(1)) // x-only (drop 02/03 prefix)
   return { privBytes, pubHex }
+}
+
+/**
+ * Blinded derivation (NIP-SKD §1) — the vault's OWN blinded key, base = the vault's root, blinded toward
+ * `peerPub`: `blinded_priv = root_priv_evenY + t`, `blinded_pub = xonly(lift_even_y(root_pub) + t·G)`.
+ * The counterparty can re-derive `blinded_pub` via {@link deriveBlindedPubForPeer} but never
+ * `blinded_priv`. Byte-identical to the client's `deriveBlindedLocal` (NIP-SKD §8 vectors).
+ */
+export function deriveBlinded(rootPriv: Uint8Array, context: string, peerPubHex: string): SubKey {
+  if (!context) throw new Error('NIP-SKD: context must be non-empty')
+  const seed = hkdfWithSalt(ecdhX(rootPriv, peerPubHex), SKD_SALT, skdInfo('blinded', context), 48)
+  const t = bytesToBigIntBE(seedToPrivKey(seed)) // reduce(seed) with the 0→1 pin
+  const rootPubComp = getPublicKey(rootPriv, true) // 33-byte compressed (02/03 ‖ x)
+  const dRaw = bytesToBigIntBE(rootPriv)
+  const dEven = (rootPubComp[0] & 1) === 1 ? SECP256K1_N - dRaw : dRaw // normalize to even-y base
+  let priv = (dEven + t) % SECP256K1_N
+  if (priv === 0n) priv = 1n // ~2^-256 invalid-key edge
+  const rootXonly = bytesToHex(rootPubComp.slice(1))
+  const pubHex = pointToXonly(liftEvenY(rootXonly).add(Point.BASE.multiply(t)))
+  return { privBytes: scalarToBytes(priv), pubHex }
+}
+
+/**
+ * Verifier-side blinded derivation (NIP-SKD §1, `getPeerBlindedPubkey`) — a PEER's blinded key toward
+ * the vault: base = `peerBaseXonly`, ECDH with the vault's root. Returns the **public key only** (no
+ * private key here). Byte-identical to the client's `deriveBlindedPubForPeer`.
+ */
+export function deriveBlindedPubForPeer(rootPriv: Uint8Array, context: string, peerBaseXonlyHex: string): string {
+  if (!context) throw new Error('NIP-SKD: context must be non-empty')
+  const seed = hkdfWithSalt(ecdhX(rootPriv, peerBaseXonlyHex), SKD_SALT, skdInfo('blinded', context), 48)
+  const t = bytesToBigIntBE(seedToPrivKey(seed))
+  return pointToXonly(liftEvenY(peerBaseXonlyHex).add(Point.BASE.multiply(t)))
 }

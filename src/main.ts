@@ -26,7 +26,7 @@ import { bytesToHex, hexToBytes } from '@noble/hashes/utils'
 import { getPublicKey, finalizeEvent, nip04, nip44, nip19, type EventTemplate } from 'nostr-tools'
 import { createTaprootTransaction, createSegwitTransaction, type UTXO } from './btc-tx'
 import { signEvmTransaction, getEvmSigningKey, type EvmChain } from './evm-tx'
-import { deriveSubKey } from './skd'
+import { deriveSubKey, deriveBlinded, deriveBlindedPubForPeer } from './skd'
 
 /* ─── Config (EDIT BEFORE DEPLOY) ─── */
 const ALLOWED_PARENT_ORIGINS = ['https://web.denchat.top']
@@ -1270,6 +1270,34 @@ const ops: Record<string, (p?: any) => Promise<unknown>> = {
     const conv = nip44.v2.utils.getConversationKey(sub.privBytes, senderPub)
     return nip44.v2.decrypt(ciphertext, conv)
   },
+
+  // ── blinded form (NIP-SKD §1) — the blinded private scalar (root_priv + t) never leaves the vault.
+  //    NIP-CHAT authors members/Pf/join under these; the owner/facilitator VERIFIES with the peer op. ──
+  async skdGetBlindedPubkey({ context, peerPub }: { context: string; peerPub: string }) {
+    if (!sessionPriv) throw new Error('Locked'); touchSession()
+    return deriveBlinded(sessionPriv, context, peerPub).pubHex
+  },
+  async skdGetPeerBlindedPubkey({ context, peerPub }: { context: string; peerPub: string }) {
+    if (!sessionPriv) throw new Error('Locked'); touchSession()
+    return deriveBlindedPubForPeer(sessionPriv, context, peerPub) // pubkey only; no private key on this side
+  },
+  async skdSignAsBlinded({ context, event, peerPub }: { context: string; event: EventTemplate; peerPub: string }) {
+    if (!sessionPriv) throw new Error('Locked'); touchSession()
+    const sub = deriveBlinded(sessionPriv, context, peerPub)
+    return finalizeEvent(event, sub.privBytes)
+  },
+  async skdNip44EncryptAsBlinded({ context, recipientPub, plaintext, peerPub }: { context: string; recipientPub: string; plaintext: string; peerPub: string }) {
+    if (!sessionPriv) throw new Error('Locked'); touchSession()
+    const sub = deriveBlinded(sessionPriv, context, peerPub)
+    const conv = nip44.v2.utils.getConversationKey(sub.privBytes, recipientPub)
+    return nip44.v2.encrypt(plaintext, conv)
+  },
+  async skdNip44DecryptAsBlinded({ context, senderPub, ciphertext, peerPub }: { context: string; senderPub: string; ciphertext: string; peerPub: string }) {
+    if (!sessionPriv) throw new Error('Locked'); touchSession()
+    const sub = deriveBlinded(sessionPriv, context, peerPub)
+    const conv = nip44.v2.utils.getConversationKey(sub.privBytes, senderPub)
+    return nip44.v2.decrypt(ciphertext, conv)
+  },
 }
 
 /* ─── Message handler (origin-allowlisted) ─── */
@@ -1347,12 +1375,22 @@ async function runSelfTest() {
     // ── NIP-SKD sub-key derivation (NIP-CHAT v2 pseudonyms) — verify against the NIP-SKD §8 reference
     //    vectors. A MISMATCH means this build derives different pseudonyms than the DEN client, so a vault
     //    user could not be found in a v2 hub's roster or decrypt its content. ──
-    const skdO = deriveSubKey(hexToBytes('11'.repeat(32)), 'nip-chat:v2:owner-pseudonym:abc-123').pubHex
-    const skdOok = skdO === '1a899ab5f78459554ba2aad008af3459597fd7906066a306f17d22415e2c59ee'
+    const ownerRoot = hexToBytes('11'.repeat(32))
+    const memberRoot = hexToBytes('22'.repeat(32))
+    const O_PUB = '94576ae28a4583c68e5641b10befe9a90c92680271dc839052937a8552fc0ae5'
+    const P_PUB = '059510a63a230047ffe6e978ade8ad31e4bfb59d414331d5b17b6d50038c51a1'
+    const R_MEMBER_PUB = '466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27'
+    const skdO = deriveSubKey(ownerRoot, 'nip-chat:v2:owner-pseudonym:abc-123').pubHex
+    const skdOok = skdO === O_PUB
     line(`NIP-SKD self (owner O): <span class="${skdOok ? 'ok' : 'fail'}">${skdOok ? 'ok (matches reference)' : 'MISMATCH — v2 pseudonyms differ from the client'}</span>`)
-    const skdP = deriveSubKey(hexToBytes('22'.repeat(32)), 'nip-chat:v2:member-pseudonym:abc-123', '1a899ab5f78459554ba2aad008af3459597fd7906066a306f17d22415e2c59ee').pubHex
-    const skdPok = skdP === 'be1eee04aba10e55fcf58ba2bd65a9c1c02c8abad9f2d607e7a511fde33cf251'
-    line(`NIP-SKD shared (member P): <span class="${skdPok ? 'ok' : 'fail'}">${skdPok ? 'ok (matches reference)' : 'MISMATCH — v2 pseudonyms differ from the client'}</span>`)
+    const skdP = deriveBlinded(memberRoot, 'nip-chat:v2:member-pseudonym:abc-123', O_PUB).pubHex
+    const skdPok = skdP === P_PUB
+    line(`NIP-SKD blinded (member P): <span class="${skdPok ? 'ok' : 'fail'}">${skdPok ? 'ok (matches reference)' : 'MISMATCH — v2 pseudonyms differ from the client'}</span>`)
+    // Owner-verification: re-derive P_pub from the member's real key via the blinded verifier op (owner never gets P_priv).
+    const oPriv = deriveSubKey(ownerRoot, 'nip-chat:v2:owner-pseudonym:abc-123').privBytes
+    const skdPverify = deriveBlindedPubForPeer(oPriv, 'nip-chat:v2:member-pseudonym:abc-123', R_MEMBER_PUB)
+    const skdSymOk = skdPverify === P_PUB
+    line(`NIP-SKD blinded symmetry (owner verifies P): <span class="${skdSymOk ? 'ok' : 'fail'}">${skdSymOk ? 'ok (owner re-derives P_pub, not P_priv)' : 'MISMATCH — owner-verification broken'}</span>`)
 
     line('<br><b class="ok">All checks passed — this origin can host the vault.</b>')
     line(`<span class="muted">pubkey: ${ev.pubkey}</span>`)
