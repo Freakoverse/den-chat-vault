@@ -1248,26 +1248,43 @@ const ops: Record<string, (p?: any) => Promise<unknown>> = {
   // user can create and chat in v2 hubs (pseudonyms O/P/Pf + the sealed-join throwaway key). The derivation
   // is byte-for-byte identical to the client reference (see src/skd.ts), so members derive matching
   // pseudonyms. Like signEvent, chat signing is NOT confirm-gated — per-message prompts would be unusable.
-  async skdGetSubkeyPubkey({ context, peerPub }: { context: string; peerPub?: string }) {
+  // ── self form (no peer) ──
+  async skdGetSelfSubkeyPubkey({ context }: { context: string }) {
+    if (!sessionPriv) throw new Error('Locked'); touchSession()
+    return deriveSubKey(sessionPriv, context).pubHex
+  },
+  async skdSignAsSelfSubkey({ context, event }: { context: string; event: EventTemplate }) {
+    if (!sessionPriv) throw new Error('Locked'); touchSession()
+    // finalizeEvent recomputes pubkey + id + sig from the sub-key private key.
+    return finalizeEvent(event, deriveSubKey(sessionPriv, context).privBytes)
+  },
+  async skdNip44EncryptAsSelfSubkey({ context, recipientPub, plaintext }: { context: string; recipientPub: string; plaintext: string }) {
+    if (!sessionPriv) throw new Error('Locked'); touchSession()
+    const conv = nip44.v2.utils.getConversationKey(deriveSubKey(sessionPriv, context).privBytes, recipientPub)
+    return nip44.v2.encrypt(plaintext, conv)
+  },
+  async skdNip44DecryptAsSelfSubkey({ context, senderPub, ciphertext }: { context: string; senderPub: string; ciphertext: string }) {
+    if (!sessionPriv) throw new Error('Locked'); touchSession()
+    const conv = nip44.v2.utils.getConversationKey(deriveSubKey(sessionPriv, context).privBytes, senderPub)
+    return nip44.v2.decrypt(ciphertext, conv)
+  },
+  // ── shared form (peer required; both parties derive the same keypair) ──
+  async skdGetSharedSubkeyPubkey({ context, peerPub }: { context: string; peerPub: string }) {
     if (!sessionPriv) throw new Error('Locked'); touchSession()
     return deriveSubKey(sessionPriv, context, peerPub).pubHex
   },
-  async skdSignAsSubkey({ context, event, peerPub }: { context: string; event: EventTemplate; peerPub?: string }) {
+  async skdSignAsSharedSubkey({ context, event, peerPub }: { context: string; event: EventTemplate; peerPub: string }) {
     if (!sessionPriv) throw new Error('Locked'); touchSession()
-    const sub = deriveSubKey(sessionPriv, context, peerPub)
-    // finalizeEvent recomputes pubkey + id + sig from the sub-key private key.
-    return finalizeEvent(event, sub.privBytes)
+    return finalizeEvent(event, deriveSubKey(sessionPriv, context, peerPub).privBytes)
   },
-  async skdNip44EncryptAsSubkey({ context, recipientPub, plaintext, peerPub }: { context: string; recipientPub: string; plaintext: string; peerPub?: string }) {
+  async skdNip44EncryptAsSharedSubkey({ context, recipientPub, plaintext, peerPub }: { context: string; recipientPub: string; plaintext: string; peerPub: string }) {
     if (!sessionPriv) throw new Error('Locked'); touchSession()
-    const sub = deriveSubKey(sessionPriv, context, peerPub)
-    const conv = nip44.v2.utils.getConversationKey(sub.privBytes, recipientPub)
+    const conv = nip44.v2.utils.getConversationKey(deriveSubKey(sessionPriv, context, peerPub).privBytes, recipientPub)
     return nip44.v2.encrypt(plaintext, conv)
   },
-  async skdNip44DecryptAsSubkey({ context, senderPub, ciphertext, peerPub }: { context: string; senderPub: string; ciphertext: string; peerPub?: string }) {
+  async skdNip44DecryptAsSharedSubkey({ context, senderPub, ciphertext, peerPub }: { context: string; senderPub: string; ciphertext: string; peerPub: string }) {
     if (!sessionPriv) throw new Error('Locked'); touchSession()
-    const sub = deriveSubKey(sessionPriv, context, peerPub)
-    const conv = nip44.v2.utils.getConversationKey(sub.privBytes, senderPub)
+    const conv = nip44.v2.utils.getConversationKey(deriveSubKey(sessionPriv, context, peerPub).privBytes, senderPub)
     return nip44.v2.decrypt(ciphertext, conv)
   },
 
