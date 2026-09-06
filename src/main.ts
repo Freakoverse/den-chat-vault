@@ -1350,7 +1350,7 @@ if (window.parent !== window) {
   document.body.style.background = 'transparent'
   // Advertise what THIS build can do so the app can feature-gate correctly (an older vault omits this, and
   // the app then keeps NIP-SKD / v2 hubs disabled instead of enabling ops this backend would reject).
-  // 'skd:1' == the sub-key ops below (skdGetSubkeyPubkey/skdSignAsSubkey/…) are present.
+  // 'skd:1' == the sub-key ops below (skdGetSelfSubkeyPubkey / skdGet(Shared|Blinded)Pubkey / skdSignAs* / …) are present.
   const capabilities = ['skd:1']
   for (const origin of ALLOWED_PARENT_ORIGINS) window.parent.postMessage({ type: 'vault-ready', capabilities }, origin)
 }
